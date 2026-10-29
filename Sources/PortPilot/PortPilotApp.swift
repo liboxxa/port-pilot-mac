@@ -496,6 +496,20 @@ struct RuntimeFailure: Identifiable {
     let message: String
 }
 
+enum PortPilotAlert: Identifiable {
+    case operationError(String)
+    case termination(DetectedPort)
+    case runtimeFailure(RuntimeFailure)
+
+    var id: String {
+        switch self {
+        case .operationError(let message): return "operation-\(message)"
+        case .termination(let port): return "termination-\(port.id)"
+        case .runtimeFailure(let failure): return "runtime-\(failure.id.uuidString)"
+        }
+    }
+}
+
 @MainActor
 final class CommandRuntime: ObservableObject {
     @Published private(set) var runningRuleIDs: Set<UUID> = []
@@ -688,8 +702,7 @@ struct PortPilotView: View {
     @StateObject private var preferences = PortPreferences()
     @State private var selectedTab = 0
     @State private var editorPreset: CommandRule?
-    @State private var launchError: String?
-    @State private var pendingTermination: DetectedPort?
+    @State private var activeAlert: PortPilotAlert?
     @State private var logTarget: PortLogTarget?
     @State private var draggedPortKey: String?
 
@@ -715,30 +728,33 @@ struct PortPilotView: View {
         .onAppear {
             monitor.refresh()
         }
-        .alert("操作失败", isPresented: Binding(
-            get: { launchError != nil },
-            set: { if !$0 { launchError = nil } }
-        )) {
-            Button("好") { launchError = nil }
-        } message: {
-            Text(launchError ?? "未知错误")
+        .onReceive(runtime.$latestFailure.compactMap { $0 }) { failure in
+            activeAlert = .runtimeFailure(failure)
         }
-        .alert(item: $pendingTermination) { port in
-            Alert(
-                title: Text("终止端口 \(port.port)？"),
-                message: Text(PortTerminator.impactDescription(for: port)),
-                primaryButton: .destructive(Text("终止")) {
-                    terminate(port)
-                },
-                secondaryButton: .cancel()
-            )
-        }
-        .alert(item: $runtime.latestFailure) { failure in
-            Alert(
-                title: Text("启动命令报错"),
-                message: Text(failure.message),
-                dismissButton: .default(Text("知道了"))
-            )
+        .alert(item: $activeAlert) { alert in
+            switch alert {
+            case .operationError(let message):
+                return Alert(
+                    title: Text("操作失败"),
+                    message: Text(message),
+                    dismissButton: .default(Text("好"))
+                )
+            case .termination(let port):
+                return Alert(
+                    title: Text("终止端口 \(port.port)？"),
+                    message: Text(PortTerminator.impactDescription(for: port)),
+                    primaryButton: .destructive(Text("终止")) {
+                        terminate(port)
+                    },
+                    secondaryButton: .cancel()
+                )
+            case .runtimeFailure(let failure):
+                return Alert(
+                    title: Text("启动命令报错"),
+                    message: Text(failure.message),
+                    dismissButton: .default(Text("知道了"))
+                )
+            }
         }
         .sheet(item: $editorPreset) { preset in
             CommandEditorView(initialRule: preset) { rule in
@@ -847,10 +863,10 @@ struct PortPilotView: View {
                                         launch(rule)
                                     }
                                 } else {
-                                    pendingTermination = port
+                                    activeAlert = .termination(port)
                                 }
                             } onTerminate: {
-                                pendingTermination = port
+                                activeAlert = .termination(port)
                             } onShowLog: {
                                 let rule = commandStore.rules.first(where: { $0.port == Optional(port.port) })
                                 logTarget = PortLogTarget(port: port, rule: rule)
@@ -944,7 +960,7 @@ struct PortPilotView: View {
                 watchForAutoAssignedPort(ruleID: rule.id, baselineKeys: baselineKeys)
             }
         } catch {
-            launchError = error.localizedDescription
+            showError(error.localizedDescription)
         }
     }
 
@@ -953,7 +969,7 @@ struct PortPilotView: View {
             try runtime.stop(rule, detectedPort: detectedPort)
             monitor.refresh()
         } catch {
-            launchError = error.localizedDescription
+            showError(error.localizedDescription)
         }
     }
 
@@ -972,7 +988,7 @@ struct PortPilotView: View {
                 }
                 if newPorts.count > 1 {
                     let ports = newPorts.map { String($0.port) }.joined(separator: ", ")
-                    launchError = "启动后发现多个新开发端口（\(ports)），无法安全自动绑定，请编辑该指令填写端口。"
+                    showError("启动后发现多个新开发端口（\(ports)），无法安全自动绑定，请编辑该指令填写端口。")
                     return
                 }
             }
@@ -983,12 +999,23 @@ struct PortPilotView: View {
         do {
             try PortTerminator.terminate(port)
             Task { @MainActor in
-                try? await Task.sleep(for: .milliseconds(250))
-                monitor.refresh()
+                for _ in 0..<8 {
+                    try? await Task.sleep(for: .milliseconds(250))
+                    monitor.refresh()
+                    let isStillOwned = monitor.ports.contains {
+                        $0.port == port.port && $0.transport == port.transport && $0.pid == port.pid
+                    }
+                    if !isStillOwned { return }
+                }
+                showError("已向 (port.process)（PID (port.pid)）发送终止信号，但端口 (port.port) 仍被占用。该进程可能忽略了 SIGTERM，请稍后重试或手动结束进程。")
             }
         } catch {
-            launchError = error.localizedDescription
+            showError(error.localizedDescription)
         }
+    }
+
+    private func showError(_ message: String) {
+        activeAlert = .operationError(message)
     }
 
     private var configuredPorts: Set<Int> {
