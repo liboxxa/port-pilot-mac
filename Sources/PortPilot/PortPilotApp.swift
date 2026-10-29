@@ -1434,8 +1434,25 @@ struct CommandEditorView: View {
             TextField("名称，例如：国内 Web", text: $name)
             TextField("端口，例如：3000", text: $port)
                 .textFieldStyle(.roundedBorder)
-            TextField("命令，例如：pnpm dev", text: $command)
-                .textFieldStyle(.roundedBorder)
+            ZStack(alignment: .topLeading) {
+                TextEditor(text: $command)
+                    .font(.system(.body, design: .monospaced))
+                    .frame(minHeight: 84, maxHeight: 132)
+                    .scrollContentBackground(.hidden)
+                    .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
+                    .overlay {
+                        RoundedRectangle(cornerRadius: 6)
+                            .stroke(Color(nsColor: .separatorColor), lineWidth: 1)
+                    }
+                if command.isEmpty {
+                    Text("命令，例如：pnpm dev")
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .padding(.leading, 6)
+                        .padding(.top, 8)
+                        .allowsHitTesting(false)
+                }
+            }
             TextField("工作目录（可选）", text: $workingDirectory)
                 .textFieldStyle(.roundedBorder)
             Text("端口可留空；启动命令后会自动识别新出现的开发端口。")
