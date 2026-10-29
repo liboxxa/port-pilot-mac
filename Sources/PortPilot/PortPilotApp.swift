@@ -211,12 +211,52 @@ struct WindowDragHandle: NSViewRepresentable {
 }
 
 final class WindowDragView: NSView {
+    private var dragStartMouseLocation: NSPoint?
+    private var dragStartWindowOrigin: NSPoint?
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+    }
+
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { self }
+
     override func mouseDown(with event: NSEvent) {
         guard let window else { return }
-        let wasMovableByWindowBackground = window.isMovableByWindowBackground
-        window.isMovableByWindowBackground = true
-        window.performDrag(with: event)
-        window.isMovableByWindowBackground = wasMovableByWindowBackground
+        dragStartMouseLocation = NSEvent.mouseLocation
+        dragStartWindowOrigin = window.frame.origin
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard
+            let window,
+            let dragStartMouseLocation,
+            let dragStartWindowOrigin
+        else { return }
+
+        let currentMouseLocation = NSEvent.mouseLocation
+        let delta = NSPoint(
+            x: currentMouseLocation.x - dragStartMouseLocation.x,
+            y: currentMouseLocation.y - dragStartMouseLocation.y
+        )
+        window.setFrameOrigin(NSPoint(
+            x: dragStartWindowOrigin.x + delta.x,
+            y: dragStartWindowOrigin.y + delta.y
+        ))
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        dragStartMouseLocation = nil
+        dragStartWindowOrigin = nil
     }
 }
 
@@ -788,7 +828,7 @@ struct PortPilotView: View {
         VStack(spacing: 0) {
             WindowDragHandle()
                 .frame(maxWidth: .infinity)
-                .frame(height: 10)
+                .frame(height: 14)
                 .help("拖动窗口")
             header
             Picker("视图", selection: $selectedTab) {
@@ -807,7 +847,7 @@ struct PortPilotView: View {
 
             WindowDragHandle()
                 .frame(maxWidth: .infinity)
-                .frame(height: 6)
+                .frame(height: 8)
                 .help("拖动窗口")
         }
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
@@ -865,7 +905,10 @@ struct PortPilotView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
-            Spacer()
+            WindowDragHandle()
+                .frame(maxWidth: .infinity)
+                .frame(height: 34)
+                .help("拖动窗口")
             Button {
                 monitor.refresh()
             } label: {
@@ -907,7 +950,9 @@ struct PortPilotView: View {
                 Text("\(orderedPorts.count) 个端口")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Spacer()
+                WindowDragHandle()
+                    .frame(maxWidth: .infinity)
+                    .help("拖动窗口")
                 if let lastUpdated = monitor.lastUpdated {
                     Text(lastUpdated, style: .time)
                         .font(.caption2)
@@ -990,7 +1035,9 @@ struct PortPilotView: View {
             HStack {
                 Text("自定义启动指令")
                     .font(.subheadline.weight(.medium))
-                Spacer()
+                WindowDragHandle()
+                    .frame(maxWidth: .infinity)
+                    .help("拖动窗口")
                 Button {
                     editorPreset = CommandRule(name: "", port: nil, command: "", workingDirectory: "")
                 } label: {
