@@ -269,17 +269,27 @@ final class PortMonitor: ObservableObject {
 }
 
 enum DevelopmentPortDetector {
-    private static let processHints = [
-        "node", "bun", "deno", "python", "uvicorn", "gunicorn", "ruby", "puma", "rails",
-        "php", "java", "gradle", "webpack", "vite", "next", "parcel", "cargo", "rust",
-        "flutter", "dart", "metro", "expo", "adb", "docker", "com.docke", "nginx", "caddy"
-    ]
+    static func category(for port: DetectedPort) -> String? {
+        let process = port.process.lowercased()
+        if process == "adb" || process.hasPrefix("adb-") { return "Android / ADB" }
+        if process == "node" || process.hasPrefix("node-") { return "Node.js" }
+        if process == "bun" || process.hasPrefix("bun-") { return "Bun" }
+        if process == "deno" || process.hasPrefix("deno-") { return "Deno" }
+        if process.hasPrefix("python") || process.hasPrefix("uvicorn") || process.hasPrefix("gunicorn") { return "Python" }
+        if process.hasPrefix("ruby") || process.hasPrefix("puma") || process.hasPrefix("rails") { return "Ruby" }
+        if process.hasPrefix("php") { return "PHP" }
+        if process.hasPrefix("java") || process.hasPrefix("gradle") { return "Java" }
+        if process.hasPrefix("webpack") || process.hasPrefix("vite") || process.hasPrefix("next") || process.hasPrefix("parcel") { return "前端构建工具" }
+        if process.hasPrefix("cargo") || process.hasPrefix("rust") { return "Rust" }
+        if process.hasPrefix("flutter") || process.hasPrefix("dart") { return "Flutter / Dart" }
+        if process.hasPrefix("metro") || process.hasPrefix("expo") { return "React Native" }
+        if process == "docker" || process.hasPrefix("docker-") || process.hasPrefix("com.docke") { return "Docker" }
+        if process.hasPrefix("nginx") || process.hasPrefix("caddy") { return "Web Server" }
+        return nil
+    }
 
     static func isLikelyDevelopment(_ port: DetectedPort) -> Bool {
-        let process = port.process.lowercased()
-        return processHints.contains { hint in
-            process == hint || process.hasPrefix("\(hint)-") || process.hasPrefix("\(hint).")
-        }
+        category(for: port) != nil
     }
 }
 
@@ -298,6 +308,7 @@ final class CommandStore: ObservableObject {
     }
 
     func add(_ rule: CommandRule) {
+        rules.removeAll { $0.port == rule.port }
         rules.append(rule)
     }
 
@@ -345,7 +356,7 @@ struct PortPilotView: View {
     @StateObject private var monitor = PortMonitor()
     @StateObject private var commandStore = CommandStore()
     @State private var selectedTab = 0
-    @State private var showingEditor = false
+    @State private var editorPreset: CommandRule?
     @State private var launchError: String?
 
     var body: some View {
@@ -378,12 +389,12 @@ struct PortPilotView: View {
         } message: {
             Text(launchError ?? "未知错误")
         }
-        .sheet(isPresented: $showingEditor) {
-            CommandEditorView { rule in
+        .sheet(item: $editorPreset) { preset in
+            CommandEditorView(initialRule: preset) { rule in
                 commandStore.add(rule)
-                showingEditor = false
+                editorPreset = nil
             } onCancel: {
-                showingEditor = false
+                editorPreset = nil
             }
         }
     }
@@ -447,6 +458,9 @@ struct PortPilotView: View {
                                 autoDiscovered: !configuredPorts.contains(port.port)
                             ) { rule in
                                 launch(rule)
+                            } onName: {
+                                let category = DevelopmentPortDetector.category(for: port) ?? "开发服务"
+                                editorPreset = CommandRule(name: category, port: port.port, command: "", workingDirectory: "")
                             }
                         }
                     }
@@ -464,7 +478,7 @@ struct PortPilotView: View {
                     .font(.subheadline.weight(.medium))
                 Spacer()
                 Button {
-                    showingEditor = true
+                    editorPreset = CommandRule(name: "", port: 0, command: "", workingDirectory: "")
                 } label: {
                     Label("添加", systemImage: "plus")
                 }
@@ -511,6 +525,7 @@ struct PortRow: View {
     let rule: CommandRule?
     let autoDiscovered: Bool
     let onLaunch: (CommandRule) -> Void
+    let onName: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -525,7 +540,17 @@ struct PortRow: View {
                     .background((port.transport == .tcp ? Color.blue : Color.orange).opacity(0.13), in: Capsule())
                 Spacer()
                 if let rule {
-                    Button("启动") { onLaunch(rule) }
+                    if rule.command.isEmpty {
+                        Text("仅监控")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Button("启动") { onLaunch(rule) }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                    }
+                } else if autoDiscovered {
+                    Button("命名") { onName() }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                 }
@@ -539,8 +564,13 @@ struct PortRow: View {
             }
             .font(.caption)
             .foregroundStyle(.secondary)
+            if let category = DevelopmentPortDetector.category(for: port) {
+                Label("类别：\(category)", systemImage: "tag")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
             if let rule {
-                Label(rule.name, systemImage: "link")
+                Label("名称：\(rule.name)", systemImage: "link")
                     .font(.caption2)
                     .foregroundStyle(.green)
             } else if autoDiscovered {
@@ -592,9 +622,15 @@ struct CommandRow: View {
                     Text(":\(rule.port)").font(.caption.monospacedDigit()).foregroundStyle(.secondary)
                     if isRunning { Text("运行中").font(.caption2).foregroundStyle(.green) }
                 }
-                Text(rule.command)
-                    .font(.caption.monospaced())
-                    .lineLimit(2)
+                if rule.command.isEmpty {
+                    Text("仅监控端口，不配置启动命令")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text(rule.command)
+                        .font(.caption.monospaced())
+                        .lineLimit(2)
+                }
                 if !rule.workingDirectory.isEmpty {
                     Text(rule.workingDirectory)
                         .font(.caption2)
@@ -604,9 +640,11 @@ struct CommandRow: View {
             }
             Spacer()
             VStack(spacing: 4) {
-                Button("启动", action: onLaunch)
-                    .buttonStyle(.borderedProminent)
-                    .controlSize(.small)
+                if !rule.command.isEmpty {
+                    Button("启动", action: onLaunch)
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                }
                 Button(action: onDelete) {
                     Image(systemName: "trash")
                 }
@@ -627,6 +665,15 @@ struct CommandEditorView: View {
     let onSave: (CommandRule) -> Void
     let onCancel: () -> Void
 
+    init(initialRule: CommandRule? = nil, onSave: @escaping (CommandRule) -> Void, onCancel: @escaping () -> Void) {
+        _name = State(initialValue: initialRule?.name ?? "")
+        _port = State(initialValue: initialRule.flatMap { $0.port > 0 ? String($0.port) : nil } ?? "")
+        _command = State(initialValue: initialRule?.command ?? "")
+        _workingDirectory = State(initialValue: initialRule?.workingDirectory ?? "")
+        self.onSave = onSave
+        self.onCancel = onCancel
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
             Text("添加启动指令")
@@ -638,18 +685,18 @@ struct CommandEditorView: View {
                 .textFieldStyle(.roundedBorder)
             TextField("工作目录（可选）", text: $workingDirectory)
                 .textFieldStyle(.roundedBorder)
-            Text("命令会在新的 Terminal 窗口中执行。")
+            Text("命令可留空，此时仅保存端口名称并监控状态。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             HStack {
                 Spacer()
                 Button("取消", action: onCancel)
                 Button("保存") {
-                    guard let portNumber = Int(port), portNumber > 0, !name.isEmpty, !command.isEmpty else { return }
+                    guard let portNumber = Int(port), portNumber > 0, !name.isEmpty else { return }
                     onSave(CommandRule(name: name, port: portNumber, command: command, workingDirectory: workingDirectory))
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(Int(port) == nil || name.isEmpty || command.isEmpty)
+                .disabled(Int(port) == nil || name.isEmpty)
             }
         }
         .padding(22)
