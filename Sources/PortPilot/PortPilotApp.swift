@@ -215,6 +215,30 @@ struct DetectedPort: Identifiable, Hashable {
     let process: String
     let pid: Int
     let user: String
+    let socketID: String
+    let pids: [Int]
+
+    init(
+        id: String,
+        port: Int,
+        transport: PortProtocol,
+        address: String,
+        process: String,
+        pid: Int,
+        user: String,
+        socketID: String = "",
+        pids: [Int] = []
+    ) {
+        self.id = id
+        self.port = port
+        self.transport = transport
+        self.address = address
+        self.process = process
+        self.pid = pid
+        self.user = user
+        self.socketID = socketID
+        self.pids = pids.isEmpty ? [pid] : pids
+    }
 }
 
 struct CommandRule: Identifiable, Codable, Hashable {
@@ -249,7 +273,7 @@ final class PortMonitor: ObservableObject {
         let tcpOutput = runLsof(arguments: ["-nP", "-iTCP", "-sTCP:LISTEN"])
         let udpOutput = runLsof(arguments: ["-nP", "-iUDP"])
         let parsed = parse(tcpOutput, transport: .tcp) + parse(udpOutput, transport: .udp)
-        ports = Dictionary(grouping: parsed, by: \.id).compactMap(\.value.first)
+        ports = Dictionary(grouping: parsed, by: \.id).values.compactMap(merge)
             .sorted { lhs, rhs in
                 if lhs.port == rhs.port { return lhs.transport.rawValue < rhs.transport.rawValue }
                 return lhs.port < rhs.port
@@ -286,15 +310,44 @@ final class PortMonitor: ObservableObject {
             let cleanAddress = String(localEndpoint.dropLast(String(port).count + 1))
             let process = String(columns[0])
             let user = String(columns[2])
-            let id = "\(transport.rawValue)-\(pid)-\(port)-\(localEndpoint)"
-            return DetectedPort(id: id, port: port, transport: transport, address: cleanAddress, process: process, pid: pid, user: user)
+            let socketID = columns.count > 5 ? String(columns[5]) : "\(pid)-\(localEndpoint)"
+            let id = "\(transport.rawValue)-\(socketID)-\(port)-\(localEndpoint)"
+            return DetectedPort(
+                id: id,
+                port: port,
+                transport: transport,
+                address: cleanAddress,
+                process: process,
+                pid: pid,
+                user: user,
+                socketID: socketID
+            )
         }
+    }
+
+    private func merge(_ group: [DetectedPort]) -> DetectedPort? {
+        guard let representative = group.max(by: { $0.pid < $1.pid }) else { return nil }
+        let pids = Array(Set(group.flatMap(\.pids))).sorted()
+        return DetectedPort(
+            id: representative.id,
+            port: representative.port,
+            transport: representative.transport,
+            address: representative.address,
+            process: representative.process,
+            pid: representative.pid,
+            user: representative.user,
+            socketID: representative.socketID,
+            pids: pids
+        )
     }
 }
 
 enum DevelopmentPortDetector {
     static func category(for port: DetectedPort) -> String? {
         let process = port.process.lowercased()
+        if port.port == 8011 && (process.hasPrefix("python") || process.hasPrefix("uvicorn")) {
+            return "Prometheus 监控"
+        }
         if process == "adb" || process.hasPrefix("adb-") { return "Android / ADB" }
         if process == "node" || process.hasPrefix("node-") { return "Node.js" }
         if process == "bun" || process.hasPrefix("bun-") { return "Bun" }
@@ -433,13 +486,15 @@ enum PortTerminator {
             return
         }
 
-        guard kill(pid_t(port.pid), SIGTERM) == 0 else {
-            let reason = String(cString: strerror(errno))
-            throw NSError(
-                domain: "PortPilot",
-                code: Int(errno),
-                userInfo: [NSLocalizedDescriptionKey: "无法终止 \(port.process)（PID \(port.pid)）：\(reason)"]
-            )
+        for pid in port.pids {
+            guard kill(pid_t(pid), SIGTERM) == 0 || errno == ESRCH else {
+                let reason = String(cString: strerror(errno))
+                throw NSError(
+                    domain: "PortPilot",
+                    code: Int(errno),
+                    userInfo: [NSLocalizedDescriptionKey: "无法终止 \(port.process)（PID \(pid)）：\(reason)"]
+                )
+            }
         }
     }
 
@@ -447,7 +502,10 @@ enum PortTerminator {
         if port.process.lowercased().hasPrefix("com.docke") {
             return "将停止映射到端口 \(port.port) 的 Docker 容器。"
         }
-        return "将向 \(port.process)（PID \(port.pid)）发送终止信号；同一进程占用的其他端口也会一起停止。"
+        let pidLabel = port.pids.count > 1
+            ? port.pids.map(String.init).joined(separator: ", ")
+            : String(port.pid)
+        return "将向 \(port.process)（PID \(pidLabel)）发送终止信号；同一进程占用的其他端口也会一起停止。"
     }
 
     private static func stopDockerContainers(for port: Int) throws {
@@ -998,9 +1056,7 @@ struct PortPilotView: View {
                 for _ in 0..<8 {
                     try? await Task.sleep(for: .milliseconds(250))
                     monitor.refresh()
-                    let isStillOwned = monitor.ports.contains {
-                        $0.port == port.port && $0.transport == port.transport && $0.pid == port.pid
-                    }
+                    let isStillOwned = monitor.ports.contains { isSameOwner($0, as: port) }
                     if !isStillOwned {
                         transitioningRuleIDs.remove(ruleID)
                         return
@@ -1048,9 +1104,7 @@ struct PortPilotView: View {
                 for _ in 0..<8 {
                     try? await Task.sleep(for: .milliseconds(250))
                     monitor.refresh()
-                    let isStillOwned = monitor.ports.contains {
-                        $0.port == port.port && $0.transport == port.transport && $0.pid == port.pid
-                    }
+                    let isStillOwned = monitor.ports.contains { isSameOwner($0, as: port) }
                     if !isStillOwned {
                         transitioningPortKeys.remove(key)
                         return
@@ -1067,6 +1121,12 @@ struct PortPilotView: View {
 
     private func showError(_ message: String) {
         activeAlert = .operationError(message)
+    }
+
+    private func isSameOwner(_ current: DetectedPort, as original: DetectedPort) -> Bool {
+        current.port == original.port
+            && current.transport == original.transport
+            && !Set(current.pids).isDisjoint(with: original.pids)
     }
 
     private var configuredPorts: Set<Int> {
@@ -1089,6 +1149,8 @@ struct PortRow: View {
     let isPinned: () -> Bool
 
     var body: some View {
+        let processLabel = DevelopmentPortDetector.category(for: port) ?? port.process
+        let pidLabel = port.pids.count > 1 ? "\(port.pid)+\(port.pids.count - 1)" : "\(port.pid)"
         HStack(spacing: 5) {
             Image(systemName: "line.3.horizontal")
                 .font(.caption2)
@@ -1116,7 +1178,7 @@ struct PortRow: View {
                         .lineLimit(1)
                         .truncationMode(.middle)
 
-                    Text(isRunning ? "· \(port.process) \(port.pid)" : "· 未运行")
+                    Text(isRunning ? "· \(processLabel) \(pidLabel)" : "· 未运行")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
