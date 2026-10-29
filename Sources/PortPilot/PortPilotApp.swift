@@ -490,30 +490,65 @@ enum PortTerminator {
     }
 }
 
+struct RuntimeFailure: Identifiable {
+    let id = UUID()
+    let ruleID: UUID
+    let message: String
+}
+
 @MainActor
 final class CommandRuntime: ObservableObject {
     @Published private(set) var runningRuleIDs: Set<UUID> = []
+    @Published private(set) var failedRuleIDs: Set<UUID> = []
+    @Published private(set) var logs: [UUID: String] = [:]
+    @Published var latestFailure: RuntimeFailure?
     private var processes: [UUID: Process] = [:]
+    private var expectedStops: Set<UUID> = []
 
     func isRunning(_ ruleID: UUID) -> Bool {
         runningRuleIDs.contains(ruleID)
     }
 
+    func log(for ruleID: UUID?) -> String {
+        guard let ruleID else { return "" }
+        return logs[ruleID] ?? ""
+    }
+
     func start(_ rule: CommandRule) throws {
         guard !isRunning(rule.id) else { return }
 
+        failedRuleIDs.remove(rule.id)
+        expectedStops.remove(rule.id)
+        logs[rule.id] = "[PortPilot] 启动命令：\(rule.command)\n"
         let command = rule.workingDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? rule.command
             : "cd \(shellQuote(rule.workingDirectory)) && \(rule.command)"
         let process = Process()
+        let outputPipe = Pipe()
+        let errorPipe = Pipe()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
         process.arguments = ["-lc", command]
         process.standardInput = FileHandle.nullDevice
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        process.terminationHandler = { [weak self] _ in
+        process.standardOutput = outputPipe
+        process.standardError = errorPipe
+        outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            Task { @MainActor [weak self] in
+                self?.appendFromPipe(data, ruleID: rule.id, label: nil)
+            }
+        }
+        errorPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            Task { @MainActor [weak self] in
+                self?.appendFromPipe(data, ruleID: rule.id, label: "错误")
+            }
+        }
+        process.terminationHandler = { [weak self] terminatedProcess in
+            let status = terminatedProcess.terminationStatus
             Task { @MainActor in
-                self?.processDidExit(rule.id)
+                self?.processDidExit(rule.id, name: rule.name, status: status)
             }
         }
         try process.run()
@@ -523,6 +558,10 @@ final class CommandRuntime: ObservableObject {
 
     func stop(_ rule: CommandRule, detectedPort: DetectedPort?) throws {
         var didStop = false
+
+        if processes[rule.id] != nil {
+            expectedStops.insert(rule.id)
+        }
 
         if let detectedPort {
             do {
@@ -544,13 +583,101 @@ final class CommandRuntime: ObservableObject {
         }
     }
 
-    private func processDidExit(_ ruleID: UUID) {
+    private func appendFromPipe(_ data: Data, ruleID: UUID, label: String?) {
+        guard let text = String(data: data, encoding: .utf8), !text.isEmpty else { return }
+        let prefix = label.map { "[\($0)] " } ?? ""
+        appendLog(prefix + text, ruleID: ruleID)
+    }
+
+    private func appendLog(_ text: String, ruleID: UUID) {
+        let maxCharacters = 60_000
+        let updated = (logs[ruleID] ?? "") + text
+        logs[ruleID] = updated.count > maxCharacters
+            ? String(updated.suffix(maxCharacters))
+            : updated
+    }
+
+    private func processDidExit(_ ruleID: UUID, name: String, status: Int32) {
         processes.removeValue(forKey: ruleID)
         runningRuleIDs.remove(ruleID)
+        if expectedStops.remove(ruleID) != nil { return }
+        guard status != 0 else { return }
+
+        failedRuleIDs.insert(ruleID)
+        let message = "“\(name)”启动命令已退出，状态码：\(status)。点击端口行可查看运行日志。"
+        appendLog("\n[PortPilot] \(message)\n", ruleID: ruleID)
+        latestFailure = RuntimeFailure(ruleID: ruleID, message: message)
     }
 
     private func shellQuote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+    }
+}
+
+struct PortLogTarget: Identifiable {
+    let id: String
+    let port: DetectedPort
+    let rule: CommandRule?
+
+    init(port: DetectedPort, rule: CommandRule?) {
+        self.port = port
+        self.rule = rule
+        let ruleKey = rule?.id.uuidString ?? "external"
+        id = "\(port.id)-\(ruleKey)"
+    }
+}
+
+struct RuntimeLogView: View {
+    @ObservedObject var runtime: CommandRuntime
+    let target: PortLogTarget
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("端口 \(target.port.port) 运行日志")
+                        .font(.headline)
+                    Text(target.rule?.name ?? "\(target.port.process) · PID \(target.port.pid)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if let rule = target.rule, runtime.failedRuleIDs.contains(rule.id) {
+                    Label("启动失败", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                Button("关闭") { dismiss() }
+            }
+
+            if let rule = target.rule {
+                Text(rule.command.isEmpty ? "仅监控端口" : rule.command)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+
+            ScrollView {
+                Text(logText)
+                    .font(.system(.caption, design: .monospaced))
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(10)
+            }
+            .background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 8))
+        }
+        .padding(16)
+        .frame(width: 520, height: 380)
+    }
+
+    private var logText: String {
+        let log = runtime.log(for: target.rule?.id)
+        if !log.isEmpty { return log }
+        if target.rule == nil {
+            return "该端口不是由 PortPilot 启动，无法读取外部进程已经产生的 stdout/stderr。\n\n当前可查看：进程、PID、协议和端口状态。"
+        }
+        return "暂无日志。\n\n只有由 PortPilot 启动的命令会捕获运行日志。"
     }
 }
 
@@ -563,6 +690,7 @@ struct PortPilotView: View {
     @State private var editorPreset: CommandRule?
     @State private var launchError: String?
     @State private var pendingTermination: DetectedPort?
+    @State private var logTarget: PortLogTarget?
     @State private var draggedPortKey: String?
 
     var body: some View {
@@ -605,6 +733,13 @@ struct PortPilotView: View {
                 secondaryButton: .cancel()
             )
         }
+        .alert(item: $runtime.latestFailure) { failure in
+            Alert(
+                title: Text("启动命令报错"),
+                message: Text(failure.message),
+                dismissButton: .default(Text("知道了"))
+            )
+        }
         .sheet(item: $editorPreset) { preset in
             CommandEditorView(initialRule: preset) { rule in
                 commandStore.add(rule)
@@ -612,6 +747,9 @@ struct PortPilotView: View {
             } onCancel: {
                 editorPreset = nil
             }
+        }
+        .sheet(item: $logTarget) { target in
+            RuntimeLogView(runtime: runtime, target: target)
         }
     }
 
@@ -689,7 +827,10 @@ struct PortPilotView: View {
                                 port: port,
                                 rule: commandStore.rules.first(where: { $0.port == Optional(port.port) }),
                                 autoDiscovered: !configuredPorts.contains(port.port),
-                                isRunning: detectedPort != nil
+                                isRunning: detectedPort != nil,
+                                hasError: commandStore.rules.first(where: { $0.port == Optional(port.port) }).map {
+                                    runtime.failedRuleIDs.contains($0.id)
+                                } ?? false
                             ) {
                                 editorPreset = commandStore.rules.first(where: { $0.port == Optional(port.port) })
                                     ?? CommandRule(
@@ -710,6 +851,9 @@ struct PortPilotView: View {
                                 }
                             } onTerminate: {
                                 pendingTermination = port
+                            } onShowLog: {
+                                let rule = commandStore.rules.first(where: { $0.port == Optional(port.port) })
+                                logTarget = PortLogTarget(port: port, rule: rule)
                             } onTogglePin: {
                                 preferences.togglePin(port)
                             } isPinned: {
@@ -764,7 +908,8 @@ struct PortPilotView: View {
                             }
                             CommandRow(
                                 rule: rule,
-                                isRunning: runtime.isRunning(rule.id) || detectedPort != nil
+                                isRunning: runtime.isRunning(rule.id) || detectedPort != nil,
+                                hasError: runtime.failedRuleIDs.contains(rule.id)
                             ) {
                                 if runtime.isRunning(rule.id) || detectedPort != nil {
                                     stop(rule, detectedPort: detectedPort)
@@ -856,9 +1001,11 @@ struct PortRow: View {
     let rule: CommandRule?
     let autoDiscovered: Bool
     let isRunning: Bool
+    let hasError: Bool
     let onEdit: () -> Void
     let onToggle: () -> Void
     let onTerminate: () -> Void
+    let onShowLog: () -> Void
     let onTogglePin: () -> Void
     let isPinned: () -> Bool
 
@@ -876,25 +1023,41 @@ struct PortRow: View {
             .buttonStyle(.borderless)
             .help(isPinned() ? "取消置顶" : "置顶端口")
 
-            Text("\(port.port)")
-                .font(.caption.monospacedDigit().weight(.bold))
-                .frame(width: 42, alignment: .trailing)
-            Text(port.transport.rawValue)
-                .font(.caption2.weight(.bold))
-                .foregroundStyle(port.transport == .tcp ? .blue : .orange)
+            Button(action: onShowLog) {
+                HStack(spacing: 5) {
+                    Text("\(port.port)")
+                        .font(.caption.monospacedDigit().weight(.bold))
+                        .frame(width: 42, alignment: .trailing)
+                    Text(port.transport.rawValue)
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(port.transport == .tcp ? .blue : .orange)
 
-            Text(rule?.name ?? DevelopmentPortDetector.category(for: port) ?? port.process)
-                .font(.caption.weight(.medium))
-                .lineLimit(1)
-                .truncationMode(.middle)
+                    Text(rule?.name ?? DevelopmentPortDetector.category(for: port) ?? port.process)
+                        .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
 
-            Text(isRunning ? "· \(port.process) \(port.pid)" : "· 未运行")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
+                    Text(isRunning ? "· \(port.process) \(port.pid)" : "· 未运行")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
 
-            Spacer(minLength: 0)
+                    if hasError {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                            .help("启动命令报错，点击查看日志")
+                    }
+
+                    Spacer(minLength: 0)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("查看运行日志")
+            .accessibilityLabel("查看端口运行日志")
 
             if isRunning || rule?.command.isEmpty == false {
                 Button(action: onToggle) {
@@ -965,6 +1128,7 @@ struct EmptyStateView: View {
 struct CommandRow: View {
     let rule: CommandRule
     let isRunning: Bool
+    let hasError: Bool
     let onToggle: () -> Void
     let onDelete: () -> Void
 
@@ -983,6 +1147,12 @@ struct CommandRow: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
             if isRunning { Text("运行中").font(.caption2).foregroundStyle(.green) }
+            if hasError {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                    .help("启动命令报错")
+            }
             Spacer()
             if !rule.command.isEmpty {
                 Button(action: onToggle) {
