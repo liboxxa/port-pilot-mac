@@ -59,7 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let contentView = PortPilotView()
         let hostingView = NSHostingView(rootView: contentView)
         let visibleFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
-        let size = NSSize(width: 440, height: 640)
+        let size = NSSize(width: 340, height: 460)
         let origin = NSPoint(
             x: visibleFrame.maxX - size.width - 18,
             y: visibleFrame.maxY - size.height - 18
@@ -77,7 +77,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         newWindow.isMovableByWindowBackground = true
         newWindow.level = .floating
         newWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        newWindow.minSize = NSSize(width: 380, height: 500)
+        newWindow.minSize = NSSize(width: 300, height: 360)
+        newWindow.isOpaque = false
+        newWindow.backgroundColor = .clear
+        newWindow.hasShadow = true
         newWindow.contentView = hostingView
         newWindow.makeKeyAndOrderFront(nil)
         window = newWindow
@@ -115,6 +118,7 @@ final class PortMonitor: ObservableObject {
     @Published private(set) var errorMessage: String?
 
     private var timer: Timer?
+    private var monitoredPorts = Set<Int>()
 
     init() {
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
@@ -128,9 +132,24 @@ final class PortMonitor: ObservableObject {
         timer?.invalidate()
     }
 
+    func updateMonitoredPorts(_ ports: Set<Int>) {
+        monitoredPorts = ports
+        refresh()
+    }
+
     func refresh() {
-        let tcpOutput = runLsof(arguments: ["-nP", "-iTCP", "-sTCP:LISTEN"])
-        let udpOutput = runLsof(arguments: ["-nP", "-iUDP"])
+        guard !monitoredPorts.isEmpty else {
+            ports = []
+            lastUpdated = Date()
+            errorMessage = nil
+            return
+        }
+
+        let portArguments = monitoredPorts.sorted()
+        let tcpArguments = ["-nP", "-sTCP:LISTEN"] + portArguments.map { "-iTCP:\($0)" }
+        let udpArguments = ["-nP"] + portArguments.map { "-iUDP:\($0)" }
+        let tcpOutput = runLsof(arguments: tcpArguments)
+        let udpOutput = runLsof(arguments: udpArguments)
         let parsed = parse(tcpOutput, transport: .tcp) + parse(udpOutput, transport: .udp)
         ports = Dictionary(grouping: parsed, by: \.id).compactMap(\.value.first)
             .sorted { lhs, rhs in
@@ -256,9 +275,13 @@ struct PortPilotView: View {
                 commandsView
             }
         }
-        .background(Color(nsColor: .windowBackgroundColor))
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .clipShape(RoundedRectangle(cornerRadius: 16))
         .onAppear {
-            monitor.refresh()
+            monitor.updateMonitoredPorts(configuredPorts)
+        }
+        .onChange(of: commandStore.rules) { _ in
+            monitor.updateMonitoredPorts(configuredPorts)
         }
         .alert("启动失败", isPresented: Binding(
             get: { launchError != nil },
@@ -302,11 +325,13 @@ struct PortPilotView: View {
     }
 
     private var portsView: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        let developmentPorts = monitor.ports.filter { configuredPorts.contains($0.port) }
+
+        return VStack(alignment: .leading, spacing: 8) {
             HStack {
-                Label("监听中", systemImage: "dot.radiowaves.left.and.right")
+                Label("开发端口", systemImage: "dot.radiowaves.left.and.right")
                     .font(.subheadline.weight(.medium))
-                Text("\(monitor.ports.count) 个端口")
+                Text("\(developmentPorts.count) 个端口")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                 Spacer()
@@ -318,12 +343,15 @@ struct PortPilotView: View {
             }
             .padding(.horizontal, 16)
 
-            if monitor.ports.isEmpty {
-                EmptyStateView(title: "暂未发现监听端口", systemImage: "network.slash", description: "PortPilot 每 3 秒自动刷新")
+            if developmentPorts.isEmpty {
+                let message = configuredPorts.isEmpty
+                    ? "请到“启动指令”添加要监控的开发端口"
+                    : "已配置端口当前没有运行中的服务"
+                EmptyStateView(title: "暂无运行中的开发端口", systemImage: "network.slash", description: message)
             } else {
                 ScrollView {
                     LazyVStack(spacing: 8) {
-                        ForEach(monitor.ports) { port in
+                        ForEach(developmentPorts) { port in
                             PortRow(port: port, rule: commandStore.rules.first(where: { $0.port == port.port })) { rule in
                                 launch(rule)
                             }
@@ -378,6 +406,10 @@ struct PortPilotView: View {
         } catch {
             launchError = error.localizedDescription
         }
+    }
+
+    private var configuredPorts: Set<Int> {
+        Set(commandStore.rules.map(\.port))
     }
 }
 
