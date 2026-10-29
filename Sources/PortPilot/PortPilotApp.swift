@@ -952,6 +952,7 @@ struct PortPilotView: View {
                     .foregroundStyle(.secondary)
                 WindowDragHandle()
                     .frame(maxWidth: .infinity)
+                    .frame(height: 22)
                     .help("拖动窗口")
                 if let lastUpdated = monitor.lastUpdated {
                     Text(lastUpdated, style: .time)
@@ -1037,6 +1038,7 @@ struct PortPilotView: View {
                     .font(.subheadline.weight(.medium))
                 WindowDragHandle()
                     .frame(maxWidth: .infinity)
+                    .frame(height: 24)
                     .help("拖动窗口")
                 Button {
                     editorPreset = CommandRule(name: "", port: nil, command: "", workingDirectory: "")
