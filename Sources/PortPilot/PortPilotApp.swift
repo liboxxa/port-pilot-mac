@@ -1,4 +1,5 @@
 import AppKit
+import Carbon.HIToolbox
 import ServiceManagement
 import SwiftUI
 
@@ -16,12 +17,34 @@ struct PortPilotMain {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var window: NSWindow?
     private var statusItem: NSStatusItem?
+    private var hotKeyRef: EventHotKeyRef?
+    private var hotKeyHandlerRef: EventHandlerRef?
+    private var hotKeyHandler: EventHandlerUPP?
+    private var globalKeyMonitor: Any?
+    private var localKeyMonitor: Any?
+    private var lastHotKeyToggle = Date.distantPast
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         try? SMAppService.mainApp.register()
         createStatusItem()
+        registerGlobalHotKey()
         showWindow()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        if let hotKeyRef {
+            UnregisterEventHotKey(hotKeyRef)
+        }
+        if let hotKeyHandlerRef {
+            RemoveEventHandler(hotKeyHandlerRef)
+        }
+        if let globalKeyMonitor {
+            NSEvent.removeMonitor(globalKeyMonitor)
+        }
+        if let localKeyMonitor {
+            NSEvent.removeMonitor(localKeyMonitor)
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -33,7 +56,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.button?.title = "◉"
 
         let menu = NSMenu()
-        menu.addItem(withTitle: "显示 PortPilot", action: #selector(showWindowFromMenu), keyEquivalent: "")
+        let toggleItem = menu.addItem(withTitle: "隐藏/显示 PortPilot", action: #selector(toggleWindowFromMenu), keyEquivalent: "p")
+        toggleItem.keyEquivalentModifierMask = [.command, .option]
         menu.addItem(.separator())
         menu.addItem(withTitle: "退出 PortPilot", action: #selector(quit), keyEquivalent: "q")
         menu.items.forEach { $0.target = self }
@@ -41,8 +65,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = item
     }
 
-    @objc private func showWindowFromMenu() {
-        showWindow()
+    @objc private func toggleWindowFromMenu() {
+        toggleWindow()
     }
 
     @objc private func quit() {
@@ -86,6 +110,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window = newWindow
         NSApp.activate(ignoringOtherApps: true)
     }
+
+    private func toggleWindow() {
+        guard let window else {
+            showWindow()
+            return
+        }
+        if window.isVisible {
+            window.orderOut(nil)
+        } else {
+            showWindow()
+        }
+    }
+
+    private func registerGlobalHotKey() {
+        var eventType = EventTypeSpec(
+            eventClass: OSType(kEventClassKeyboard),
+            eventKind: OSType(kEventHotKeyPressed)
+        )
+        hotKeyHandler = { _, _, _ in
+            DispatchQueue.main.async {
+                (NSApp.delegate as? AppDelegate)?.handleHotKey()
+            }
+            return noErr
+        }
+        guard let hotKeyHandler else { return }
+        InstallEventHandler(
+            GetApplicationEventTarget(),
+            hotKeyHandler,
+            1,
+            &eventType,
+            nil,
+            &hotKeyHandlerRef
+        )
+
+        let hotKeyID = EventHotKeyID(signature: OSType(0x50504C54), id: 1)
+        RegisterEventHotKey(
+            UInt32(kVK_ANSI_P),
+            UInt32(optionKey | cmdKey),
+            hotKeyID,
+            GetApplicationEventTarget(),
+            0,
+            &hotKeyRef
+        )
+        registerNSEventFallback()
+    }
+
+    private func registerNSEventFallback() {
+        let handler: (NSEvent) -> Void = { [weak self] event in
+            guard event.keyCode == UInt16(kVK_ANSI_P) else { return }
+            let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+            guard modifiers == [.command, .option] else { return }
+            self?.handleHotKey()
+        }
+        globalKeyMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: handler)
+        localKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            handler(event)
+            return event
+        }
+    }
+
+    private func handleHotKey() {
+        let now = Date()
+        guard now.timeIntervalSince(lastHotKeyToggle) > 0.25 else { return }
+        lastHotKeyToggle = now
+        toggleWindow()
+    }
 }
 
 enum PortProtocol: String, Codable, CaseIterable {
@@ -118,7 +208,6 @@ final class PortMonitor: ObservableObject {
     @Published private(set) var errorMessage: String?
 
     private var timer: Timer?
-    private var monitoredPorts = Set<Int>()
 
     init() {
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
@@ -132,24 +221,9 @@ final class PortMonitor: ObservableObject {
         timer?.invalidate()
     }
 
-    func updateMonitoredPorts(_ ports: Set<Int>) {
-        monitoredPorts = ports
-        refresh()
-    }
-
     func refresh() {
-        guard !monitoredPorts.isEmpty else {
-            ports = []
-            lastUpdated = Date()
-            errorMessage = nil
-            return
-        }
-
-        let portArguments = monitoredPorts.sorted()
-        let tcpArguments = ["-nP", "-sTCP:LISTEN"] + portArguments.map { "-iTCP:\($0)" }
-        let udpArguments = ["-nP"] + portArguments.map { "-iUDP:\($0)" }
-        let tcpOutput = runLsof(arguments: tcpArguments)
-        let udpOutput = runLsof(arguments: udpArguments)
+        let tcpOutput = runLsof(arguments: ["-nP", "-iTCP", "-sTCP:LISTEN"])
+        let udpOutput = runLsof(arguments: ["-nP", "-iUDP"])
         let parsed = parse(tcpOutput, transport: .tcp) + parse(udpOutput, transport: .udp)
         ports = Dictionary(grouping: parsed, by: \.id).compactMap(\.value.first)
             .sorted { lhs, rhs in
@@ -183,12 +257,28 @@ final class PortMonitor: ObservableObject {
             let columns = line.split(whereSeparator: { $0 == " " || $0 == "\t" })
             guard columns.count >= 9, columns[0] != "COMMAND", let pid = Int(columns[1]) else { return nil }
             let endpoint = String(columns[8]).replacingOccurrences(of: " (LISTEN)", with: "")
-            guard let port = endpoint.split(separator: ":").last.flatMap({ Int($0) }) else { return nil }
-            let cleanAddress = String(endpoint.dropLast(String(port).count + 1))
+            let localEndpoint = endpoint.components(separatedBy: "->").first ?? endpoint
+            guard let port = localEndpoint.split(separator: ":").last.flatMap({ Int($0) }) else { return nil }
+            let cleanAddress = String(localEndpoint.dropLast(String(port).count + 1))
             let process = String(columns[0])
             let user = String(columns[2])
-            let id = "\(transport.rawValue)-\(pid)-\(port)-\(endpoint)"
+            let id = "\(transport.rawValue)-\(pid)-\(port)-\(localEndpoint)"
             return DetectedPort(id: id, port: port, transport: transport, address: cleanAddress, process: process, pid: pid, user: user)
+        }
+    }
+}
+
+enum DevelopmentPortDetector {
+    private static let processHints = [
+        "node", "bun", "deno", "python", "uvicorn", "gunicorn", "ruby", "puma", "rails",
+        "php", "java", "gradle", "webpack", "vite", "next", "parcel", "cargo", "rust",
+        "flutter", "dart", "metro", "expo", "adb", "docker", "com.docke", "nginx", "caddy"
+    ]
+
+    static func isLikelyDevelopment(_ port: DetectedPort) -> Bool {
+        let process = port.process.lowercased()
+        return processHints.contains { hint in
+            process == hint || process.hasPrefix("\(hint)-") || process.hasPrefix("\(hint).")
         }
     }
 }
@@ -278,10 +368,7 @@ struct PortPilotView: View {
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
         .clipShape(RoundedRectangle(cornerRadius: 16))
         .onAppear {
-            monitor.updateMonitoredPorts(configuredPorts)
-        }
-        .onChange(of: commandStore.rules) { _ in
-            monitor.updateMonitoredPorts(configuredPorts)
+            monitor.refresh()
         }
         .alert("启动失败", isPresented: Binding(
             get: { launchError != nil },
@@ -325,7 +412,9 @@ struct PortPilotView: View {
     }
 
     private var portsView: some View {
-        let developmentPorts = monitor.ports.filter { configuredPorts.contains($0.port) }
+        let developmentPorts = monitor.ports.filter {
+            configuredPorts.contains($0.port) || DevelopmentPortDetector.isLikelyDevelopment($0)
+        }
 
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -345,14 +434,18 @@ struct PortPilotView: View {
 
             if developmentPorts.isEmpty {
                 let message = configuredPorts.isEmpty
-                    ? "请到“启动指令”添加要监控的开发端口"
+                    ? "未发现开发进程，可到“启动指令”添加端口"
                     : "已配置端口当前没有运行中的服务"
                 EmptyStateView(title: "暂无运行中的开发端口", systemImage: "network.slash", description: message)
             } else {
                 ScrollView {
                     LazyVStack(spacing: 8) {
                         ForEach(developmentPorts) { port in
-                            PortRow(port: port, rule: commandStore.rules.first(where: { $0.port == port.port })) { rule in
+                            PortRow(
+                                port: port,
+                                rule: commandStore.rules.first(where: { $0.port == port.port }),
+                                autoDiscovered: !configuredPorts.contains(port.port)
+                            ) { rule in
                                 launch(rule)
                             }
                         }
@@ -416,6 +509,7 @@ struct PortPilotView: View {
 struct PortRow: View {
     let port: DetectedPort
     let rule: CommandRule?
+    let autoDiscovered: Bool
     let onLaunch: (CommandRule) -> Void
 
     var body: some View {
@@ -449,6 +543,10 @@ struct PortRow: View {
                 Label(rule.name, systemImage: "link")
                     .font(.caption2)
                     .foregroundStyle(.green)
+            } else if autoDiscovered {
+                Label("自动发现 · 开发进程特征", systemImage: "wand.and.stars")
+                    .font(.caption2)
+                    .foregroundStyle(.purple)
             }
         }
         .padding(11)
