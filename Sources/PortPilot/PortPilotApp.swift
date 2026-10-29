@@ -705,6 +705,8 @@ struct PortPilotView: View {
     @State private var activeAlert: PortPilotAlert?
     @State private var logTarget: PortLogTarget?
     @State private var draggedPortKey: String?
+    @State private var transitioningPortKeys: Set<String> = []
+    @State private var transitioningRuleIDs: Set<UUID> = []
 
     var body: some View {
         VStack(spacing: 0) {
@@ -839,16 +841,17 @@ struct PortPilotView: View {
                     LazyVStack(spacing: 8) {
                         ForEach(orderedPorts) { port in
                             let detectedPort = monitor.ports.first(where: { $0.port == port.port })
+                            let rule = commandStore.rules.first(where: { $0.port == Optional(port.port) })
                             PortRow(
                                 port: port,
-                                rule: commandStore.rules.first(where: { $0.port == Optional(port.port) }),
+                                rule: rule,
                                 autoDiscovered: !configuredPorts.contains(port.port),
                                 isRunning: detectedPort != nil,
-                                hasError: commandStore.rules.first(where: { $0.port == Optional(port.port) }).map {
-                                    runtime.failedRuleIDs.contains($0.id)
-                                } ?? false
+                                hasError: rule.map { runtime.failedRuleIDs.contains($0.id) } ?? false,
+                                isTransitioning: transitioningPortKeys.contains(PortPreferences.key(for: port))
+                                    || rule.map { transitioningRuleIDs.contains($0.id) } == true
                             ) {
-                                editorPreset = commandStore.rules.first(where: { $0.port == Optional(port.port) })
+                                editorPreset = rule
                                     ?? CommandRule(
                                         name: DevelopmentPortDetector.category(for: port) ?? "开发服务",
                                         port: port.port,
@@ -856,7 +859,8 @@ struct PortPilotView: View {
                                         workingDirectory: ""
                                     )
                             } onToggle: {
-                                if let rule = commandStore.rules.first(where: { $0.port == Optional(port.port) }) {
+                                guard !transitioningPortKeys.contains(PortPreferences.key(for: port)) else { return }
+                                if let rule {
                                     if let detectedPort {
                                         stop(rule, detectedPort: detectedPort)
                                     } else {
@@ -868,7 +872,6 @@ struct PortPilotView: View {
                             } onTerminate: {
                                 activeAlert = .termination(port)
                             } onShowLog: {
-                                let rule = commandStore.rules.first(where: { $0.port == Optional(port.port) })
                                 logTarget = PortLogTarget(port: port, rule: rule)
                             } onTogglePin: {
                                 preferences.togglePin(port)
@@ -925,8 +928,10 @@ struct PortPilotView: View {
                             CommandRow(
                                 rule: rule,
                                 isRunning: runtime.isRunning(rule.id) || detectedPort != nil,
-                                hasError: runtime.failedRuleIDs.contains(rule.id)
+                                hasError: runtime.failedRuleIDs.contains(rule.id),
+                                isTransitioning: transitioningRuleIDs.contains(rule.id)
                             ) {
+                                guard !transitioningRuleIDs.contains(rule.id) else { return }
                                 if runtime.isRunning(rule.id) || detectedPort != nil {
                                     stop(rule, detectedPort: detectedPort)
                                 } else {
@@ -945,6 +950,8 @@ struct PortPilotView: View {
     }
 
     private func launch(_ rule: CommandRule) {
+        guard !transitioningRuleIDs.contains(rule.id) else { return }
+        transitioningRuleIDs.insert(rule.id)
         let shouldAutoAssign = rule.port == nil
         let baselineKeys: Set<String>
         if shouldAutoAssign {
@@ -956,20 +963,56 @@ struct PortPilotView: View {
 
         do {
             try runtime.start(rule)
+            finishRuleTransitionAfterDelay(rule.id)
             if shouldAutoAssign {
                 watchForAutoAssignedPort(ruleID: rule.id, baselineKeys: baselineKeys)
             }
         } catch {
+            transitioningRuleIDs.remove(rule.id)
             showError(error.localizedDescription)
         }
     }
 
     private func stop(_ rule: CommandRule, detectedPort: DetectedPort?) {
+        guard !transitioningRuleIDs.contains(rule.id) else { return }
+        transitioningRuleIDs.insert(rule.id)
         do {
             try runtime.stop(rule, detectedPort: detectedPort)
-            monitor.refresh()
+            waitForRuleStop(rule.id, port: detectedPort)
         } catch {
+            transitioningRuleIDs.remove(rule.id)
             showError(error.localizedDescription)
+        }
+    }
+
+    private func finishRuleTransitionAfterDelay(_ ruleID: UUID) {
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(700))
+            transitioningRuleIDs.remove(ruleID)
+        }
+    }
+
+    private func waitForRuleStop(_ ruleID: UUID, port: DetectedPort?) {
+        Task { @MainActor in
+            if let port {
+                for _ in 0..<8 {
+                    try? await Task.sleep(for: .milliseconds(250))
+                    monitor.refresh()
+                    let isStillOwned = monitor.ports.contains {
+                        $0.port == port.port && $0.transport == port.transport && $0.pid == port.pid
+                    }
+                    if !isStillOwned {
+                        transitioningRuleIDs.remove(ruleID)
+                        return
+                    }
+                }
+                transitioningRuleIDs.remove(ruleID)
+                showError("已发送停止信号，但端口 " + String(port.port) + " 仍被占用。")
+            } else {
+                try? await Task.sleep(for: .milliseconds(700))
+                monitor.refresh()
+                transitioningRuleIDs.remove(ruleID)
+            }
         }
     }
 
@@ -996,6 +1039,9 @@ struct PortPilotView: View {
     }
 
     private func terminate(_ port: DetectedPort) {
+        let key = PortPreferences.key(for: port)
+        guard !transitioningPortKeys.contains(key) else { return }
+        transitioningPortKeys.insert(key)
         do {
             try PortTerminator.terminate(port)
             Task { @MainActor in
@@ -1005,11 +1051,16 @@ struct PortPilotView: View {
                     let isStillOwned = monitor.ports.contains {
                         $0.port == port.port && $0.transport == port.transport && $0.pid == port.pid
                     }
-                    if !isStillOwned { return }
+                    if !isStillOwned {
+                        transitioningPortKeys.remove(key)
+                        return
+                    }
                 }
-                showError("已向 (port.process)（PID (port.pid)）发送终止信号，但端口 (port.port) 仍被占用。该进程可能忽略了 SIGTERM，请稍后重试或手动结束进程。")
+                transitioningPortKeys.remove(key)
+                showError("已向 " + port.process + "（PID " + String(port.pid) + "）发送终止信号，但端口 " + String(port.port) + " 仍被占用。该进程可能忽略了 SIGTERM，请稍后重试或手动结束进程。")
             }
         } catch {
+            transitioningPortKeys.remove(key)
             showError(error.localizedDescription)
         }
     }
@@ -1029,6 +1080,7 @@ struct PortRow: View {
     let autoDiscovered: Bool
     let isRunning: Bool
     let hasError: Bool
+    let isTransitioning: Bool
     let onEdit: () -> Void
     let onToggle: () -> Void
     let onTerminate: () -> Void
@@ -1086,7 +1138,14 @@ struct PortRow: View {
             .help("查看运行日志")
             .accessibilityLabel("查看端口运行日志")
 
-            if isRunning || rule?.command.isEmpty == false {
+            if isTransitioning {
+                ProgressView()
+                    .controlSize(.small)
+                    .scaleEffect(0.7)
+                    .frame(width: 16, height: 16)
+                    .help("正在处理")
+                    .accessibilityLabel("正在处理")
+            } else if isRunning || rule?.command.isEmpty == false {
                 Button(action: onToggle) {
                     Image(systemName: isRunning ? "pause.fill" : "play.fill")
                 }
@@ -1108,7 +1167,7 @@ struct PortRow: View {
         .padding(.vertical, 7)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
         .contextMenu {
-            if isRunning {
+            if isRunning && !isTransitioning {
                 Button("终止占用此端口的进程", role: .destructive, action: onTerminate)
             }
         }
@@ -1156,6 +1215,7 @@ struct CommandRow: View {
     let rule: CommandRule
     let isRunning: Bool
     let hasError: Bool
+    let isTransitioning: Bool
     let onToggle: () -> Void
     let onDelete: () -> Void
 
@@ -1181,7 +1241,14 @@ struct CommandRow: View {
                     .help("启动命令报错")
             }
             Spacer()
-            if !rule.command.isEmpty {
+            if isTransitioning {
+                ProgressView()
+                    .controlSize(.small)
+                    .scaleEffect(0.7)
+                    .frame(width: 16, height: 16)
+                    .help("正在处理")
+                    .accessibilityLabel("正在处理")
+            } else if !rule.command.isEmpty {
                 Button(action: onToggle) {
                     Image(systemName: isRunning ? "pause.fill" : "play.fill")
                 }
@@ -1195,6 +1262,7 @@ struct CommandRow: View {
             }
             .buttonStyle(.borderless)
             .foregroundStyle(.secondary)
+            .disabled(isTransitioning)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 7)
