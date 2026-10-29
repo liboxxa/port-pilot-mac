@@ -115,7 +115,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let newWindow = NSWindow(
             contentRect: NSRect(origin: origin, size: size),
-            styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
         )
@@ -831,11 +831,12 @@ struct PortPilotView: View {
                 .frame(height: 14)
                 .help("拖动窗口")
             header
-            Picker("视图", selection: $selectedTab) {
+            Picker("", selection: $selectedTab) {
                 Text("监听端口").tag(0)
                 Text("启动指令").tag(1)
             }
             .pickerStyle(.segmented)
+            .labelsHidden()
             .padding(.horizontal, 16)
             .padding(.bottom, 10)
 
