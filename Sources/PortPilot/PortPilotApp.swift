@@ -374,6 +374,12 @@ final class PortPreferences: ObservableObject {
         pinnedKeys.contains(Self.key(for: port))
     }
 
+    func pinnedTransport(for port: Int) -> PortProtocol? {
+        if pinnedKeys.contains("TCP-\(port)") { return .tcp }
+        if pinnedKeys.contains("UDP-\(port)") { return .udp }
+        return nil
+    }
+
     func togglePin(_ port: DetectedPort) {
         let key = Self.key(for: port)
         if pinnedKeys.contains(key) {
@@ -636,7 +642,22 @@ struct PortPilotView: View {
         let developmentPorts = monitor.ports.filter {
             configuredPorts.contains($0.port) || DevelopmentPortDetector.isLikelyDevelopment($0)
         }
-        let orderedPorts = preferences.ordered(developmentPorts)
+        let runningPortNumbers = Set(monitor.ports.map(\.port))
+        let pinnedStoppedPorts = commandStore.rules.compactMap { rule -> DetectedPort? in
+            guard let port = rule.port,
+                  let transport = preferences.pinnedTransport(for: port),
+                  !runningPortNumbers.contains(port) else { return nil }
+            return DetectedPort(
+                id: "configured-\(transport.rawValue)-\(port)",
+                port: port,
+                transport: transport,
+                address: "",
+                process: "未运行",
+                pid: 0,
+                user: ""
+            )
+        }
+        let orderedPorts = preferences.ordered(developmentPorts + pinnedStoppedPorts)
 
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -663,11 +684,12 @@ struct PortPilotView: View {
                 ScrollView {
                     LazyVStack(spacing: 8) {
                         ForEach(orderedPorts) { port in
+                            let detectedPort = monitor.ports.first(where: { $0.port == port.port })
                             PortRow(
                                 port: port,
                                 rule: commandStore.rules.first(where: { $0.port == Optional(port.port) }),
                                 autoDiscovered: !configuredPorts.contains(port.port),
-                                isRunning: true
+                                isRunning: detectedPort != nil
                             ) {
                                 editorPreset = commandStore.rules.first(where: { $0.port == Optional(port.port) })
                                     ?? CommandRule(
@@ -678,7 +700,11 @@ struct PortPilotView: View {
                                     )
                             } onToggle: {
                                 if let rule = commandStore.rules.first(where: { $0.port == Optional(port.port) }) {
-                                    stop(rule, detectedPort: port)
+                                    if let detectedPort {
+                                        stop(rule, detectedPort: detectedPort)
+                                    } else {
+                                        launch(rule)
+                                    }
                                 } else {
                                     pendingTermination = port
                                 }
@@ -862,7 +888,7 @@ struct PortRow: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
 
-            Text("· \(port.process) \(port.pid)")
+            Text(isRunning ? "· \(port.process) \(port.pid)" : "· 未运行")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -870,14 +896,14 @@ struct PortRow: View {
 
             Spacer(minLength: 0)
 
-            if isRunning {
+            if isRunning || rule?.command.isEmpty == false {
                 Button(action: onToggle) {
-                    Image(systemName: "pause.fill")
+                    Image(systemName: isRunning ? "pause.fill" : "play.fill")
                 }
                 .buttonStyle(.borderless)
-                .foregroundStyle(Color.secondary)
-                .help("暂停端口")
-                .accessibilityLabel("暂停端口")
+                .foregroundStyle(isRunning ? Color.secondary : Color.green)
+                .help(isRunning ? "暂停端口" : "启动端口")
+                .accessibilityLabel(isRunning ? "暂停端口" : "启动端口")
             }
 
             Button(action: onEdit) {
@@ -892,7 +918,9 @@ struct PortRow: View {
         .padding(.vertical, 7)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
         .contextMenu {
-            Button("终止占用此端口的进程", role: .destructive, action: onTerminate)
+            if isRunning {
+                Button("终止占用此端口的进程", role: .destructive, action: onTerminate)
+            }
         }
     }
 }
