@@ -28,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         try? SMAppService.mainApp.register()
+        createMainMenu()
         createStatusItem()
         registerGlobalHotKey()
         showWindow()
@@ -66,6 +67,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = item
     }
 
+    private func createMainMenu() {
+        let mainMenu = NSMenu()
+
+        let appMenuItem = NSMenuItem()
+        let appMenu = NSMenu()
+        appMenu.addItem(withTitle: "退出 PortPilot", action: #selector(quit), keyEquivalent: "q")
+        appMenu.items.forEach { $0.target = self }
+        appMenuItem.submenu = appMenu
+        mainMenu.addItem(appMenuItem)
+
+        let editMenuItem = NSMenuItem()
+        let editMenu = NSMenu(title: "编辑")
+        editMenu.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "复制", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenuItem.submenu = editMenu
+        mainMenu.addItem(editMenuItem)
+
+        NSApp.mainMenu = mainMenu
+    }
+
     @objc private func toggleWindowFromMenu() {
         toggleWindow()
     }
@@ -99,7 +122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         newWindow.title = "PortPilot"
         newWindow.titleVisibility = .hidden
         newWindow.titlebarAppearsTransparent = true
-        newWindow.isMovableByWindowBackground = true
+        newWindow.isMovableByWindowBackground = false
         newWindow.level = .floating
         newWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         newWindow.minSize = NSSize(width: 300, height: 320)
@@ -197,7 +220,7 @@ struct DetectedPort: Identifiable, Hashable {
 struct CommandRule: Identifiable, Codable, Hashable {
     var id: UUID = UUID()
     var name: String
-    var port: Int
+    var port: Int?
     var command: String
     var workingDirectory: String
 }
@@ -309,8 +332,15 @@ final class CommandStore: ObservableObject {
     }
 
     func add(_ rule: CommandRule) {
-        rules.removeAll { $0.port == rule.port }
+        rules.removeAll { existing in
+            existing.id == rule.id || (rule.port != nil && existing.port == rule.port)
+        }
         rules.append(rule)
+    }
+
+    func assignPort(_ port: Int, to ruleID: UUID) {
+        guard let index = rules.firstIndex(where: { $0.id == ruleID }) else { return }
+        rules[index].port = port
     }
 
     func remove(_ rule: CommandRule) {
@@ -600,12 +630,12 @@ struct PortPilotView: View {
                         ForEach(orderedPorts) { port in
                             PortRow(
                                 port: port,
-                                rule: commandStore.rules.first(where: { $0.port == port.port }),
+                                rule: commandStore.rules.first(where: { $0.port == Optional(port.port) }),
                                 autoDiscovered: !configuredPorts.contains(port.port)
                             ) { rule in
                                 launch(rule)
                             } onEdit: {
-                                editorPreset = commandStore.rules.first(where: { $0.port == port.port })
+                                editorPreset = commandStore.rules.first(where: { $0.port == Optional(port.port) })
                                     ?? CommandRule(
                                         name: DevelopmentPortDetector.category(for: port) ?? "开发服务",
                                         port: port.port,
@@ -648,7 +678,7 @@ struct PortPilotView: View {
                     .font(.subheadline.weight(.medium))
                 Spacer()
                 Button {
-                    editorPreset = CommandRule(name: "", port: 0, command: "", workingDirectory: "")
+                    editorPreset = CommandRule(name: "", port: nil, command: "", workingDirectory: "")
                 } label: {
                     Label("添加", systemImage: "plus")
                 }
@@ -663,7 +693,9 @@ struct PortPilotView: View {
                 ScrollView {
                     LazyVStack(spacing: 8) {
                         ForEach(commandStore.rules) { rule in
-                            CommandRow(rule: rule, isRunning: monitor.ports.contains(where: { $0.port == rule.port })) {
+                            CommandRow(rule: rule, isRunning: rule.port.map { port in
+                                monitor.ports.contains(where: { $0.port == port })
+                            } ?? false) {
                                 launch(rule)
                             } onDelete: {
                                 commandStore.remove(rule)
@@ -678,10 +710,44 @@ struct PortPilotView: View {
     }
 
     private func launch(_ rule: CommandRule) {
+        let shouldAutoAssign = rule.port == nil
+        let baselineKeys: Set<String>
+        if shouldAutoAssign {
+            monitor.refresh()
+            baselineKeys = Set(monitor.ports.map(PortPreferences.key(for:)))
+        } else {
+            baselineKeys = []
+        }
+
         do {
             try CommandLauncher.launch(rule)
+            if shouldAutoAssign {
+                watchForAutoAssignedPort(ruleID: rule.id, baselineKeys: baselineKeys)
+            }
         } catch {
             launchError = error.localizedDescription
+        }
+    }
+
+    private func watchForAutoAssignedPort(ruleID: UUID, baselineKeys: Set<String>) {
+        Task { @MainActor in
+            for _ in 0..<15 {
+                try? await Task.sleep(for: .seconds(1))
+                monitor.refresh()
+                let newPorts = monitor.ports.filter {
+                    !baselineKeys.contains(PortPreferences.key(for: $0))
+                        && DevelopmentPortDetector.isLikelyDevelopment($0)
+                }
+                if newPorts.count == 1 {
+                    commandStore.assignPort(newPorts[0].port, to: ruleID)
+                    return
+                }
+                if newPorts.count > 1 {
+                    let ports = newPorts.map { String($0.port) }.joined(separator: ", ")
+                    launchError = "启动后发现多个新开发端口（\(ports)），无法安全自动绑定，请编辑该指令填写端口。"
+                    return
+                }
+            }
         }
     }
 
@@ -698,7 +764,7 @@ struct PortPilotView: View {
     }
 
     private var configuredPorts: Set<Int> {
-        Set(commandStore.rules.map(\.port))
+        Set(commandStore.rules.compactMap(\.port))
     }
 }
 
@@ -826,7 +892,7 @@ struct CommandRow: View {
             Image(systemName: isRunning ? "checkmark.circle.fill" : "terminal.fill")
                 .foregroundStyle(isRunning ? .green : .secondary)
                 .font(.caption)
-            Text("\(rule.name):\(rule.port)")
+            Text(rule.name + ":" + (rule.port.map(String.init) ?? "自动"))
                 .font(.caption.weight(.medium))
                 .lineLimit(1)
             Text(rule.command.isEmpty ? "仅监控" : rule.command)
@@ -858,6 +924,7 @@ struct CommandRow: View {
 }
 
 struct CommandEditorView: View {
+    private let ruleID: UUID
     @State private var name = ""
     @State private var port = ""
     @State private var command = ""
@@ -866,8 +933,9 @@ struct CommandEditorView: View {
     let onCancel: () -> Void
 
     init(initialRule: CommandRule? = nil, onSave: @escaping (CommandRule) -> Void, onCancel: @escaping () -> Void) {
+        ruleID = initialRule?.id ?? UUID()
         _name = State(initialValue: initialRule?.name ?? "")
-        _port = State(initialValue: initialRule.flatMap { $0.port > 0 ? String($0.port) : nil } ?? "")
+        _port = State(initialValue: initialRule?.port.map(String.init) ?? "")
         _command = State(initialValue: initialRule?.command ?? "")
         _workingDirectory = State(initialValue: initialRule?.workingDirectory ?? "")
         self.onSave = onSave
@@ -885,21 +953,34 @@ struct CommandEditorView: View {
                 .textFieldStyle(.roundedBorder)
             TextField("工作目录（可选）", text: $workingDirectory)
                 .textFieldStyle(.roundedBorder)
-            Text("命令可留空，此时仅保存端口名称并监控状态。")
+            Text("端口可留空；启动命令后会自动识别新出现的开发端口。")
                 .font(.caption)
                 .foregroundStyle(.secondary)
             HStack {
                 Spacer()
                 Button("取消", action: onCancel)
                 Button("保存") {
-                    guard let portNumber = Int(port), portNumber > 0, !name.isEmpty else { return }
-                    onSave(CommandRule(name: name, port: portNumber, command: command, workingDirectory: workingDirectory))
+                    let trimmedPort = port.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let trimmedCommand = command.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let portNumber = trimmedPort.isEmpty ? nil : Int(trimmedPort)
+                    guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                          (portNumber != nil || !trimmedCommand.isEmpty) else { return }
+                    onSave(CommandRule(id: ruleID, name: name, port: portNumber, command: command, workingDirectory: workingDirectory))
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(Int(port) == nil || name.isEmpty)
+                .disabled(!canSave)
             }
         }
         .padding(22)
         .frame(width: 360)
+    }
+
+    private var canSave: Bool {
+        let trimmedPort = port.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedCommand = command.trimmingCharacters(in: .whitespacesAndNewlines)
+        let validPort = trimmedPort.isEmpty || (Int(trimmedPort).map { $0 > 0 } ?? false)
+        return !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && validPort
+            && (!trimmedPort.isEmpty || !trimmedCommand.isEmpty)
     }
 }
