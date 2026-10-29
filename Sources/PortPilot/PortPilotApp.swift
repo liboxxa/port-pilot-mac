@@ -484,32 +484,66 @@ enum PortTerminator {
     }
 }
 
-enum CommandLauncher {
-    static func launch(_ rule: CommandRule) throws {
+@MainActor
+final class CommandRuntime: ObservableObject {
+    @Published private(set) var runningRuleIDs: Set<UUID> = []
+    private var processes: [UUID: Process] = [:]
+
+    func isRunning(_ ruleID: UUID) -> Bool {
+        runningRuleIDs.contains(ruleID)
+    }
+
+    func start(_ rule: CommandRule) throws {
+        guard !isRunning(rule.id) else { return }
+
         let command = rule.workingDirectory.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? rule.command
             : "cd \(shellQuote(rule.workingDirectory)) && \(rule.command)"
-        let escaped = command
-            .replacingOccurrences(of: "\\", with: "\\\\")
-            .replacingOccurrences(of: "\"", with: "\\\"")
-            .replacingOccurrences(of: "\n", with: "; ")
-        let script = """
-        tell application "Terminal"
-            activate
-            do script "\(escaped)"
-        end tell
-        """
-        var error: NSDictionary?
-        guard let appleScript = NSAppleScript(source: script) else {
-            throw NSError(domain: "PortPilot", code: 1, userInfo: [NSLocalizedDescriptionKey: "无法创建 Terminal 启动脚本"])
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-lc", command]
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        process.terminationHandler = { [weak self] _ in
+            Task { @MainActor in
+                self?.processDidExit(rule.id)
+            }
         }
-        appleScript.executeAndReturnError(&error)
-        if let error {
-            throw NSError(domain: "PortPilot", code: 2, userInfo: [NSLocalizedDescriptionKey: error.description])
+        try process.run()
+        processes[rule.id] = process
+        runningRuleIDs.insert(rule.id)
+    }
+
+    func stop(_ rule: CommandRule, detectedPort: DetectedPort?) throws {
+        var didStop = false
+
+        if let detectedPort {
+            do {
+                try PortTerminator.terminate(detectedPort)
+                didStop = true
+            } catch where processes[rule.id] != nil {
+                // The launched process below is still a valid fallback when the port owner exited first.
+            }
+        }
+
+        if let process = processes.removeValue(forKey: rule.id) {
+            if process.isRunning { process.terminate() }
+            runningRuleIDs.remove(rule.id)
+            didStop = true
+        }
+
+        guard didStop else {
+            throw NSError(domain: "PortPilot", code: 20, userInfo: [NSLocalizedDescriptionKey: "没有找到可停止的运行进程"])
         }
     }
 
-    private static func shellQuote(_ value: String) -> String {
+    private func processDidExit(_ ruleID: UUID) {
+        processes.removeValue(forKey: ruleID)
+        runningRuleIDs.remove(ruleID)
+    }
+
+    private func shellQuote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
     }
 }
@@ -517,6 +551,7 @@ enum CommandLauncher {
 struct PortPilotView: View {
     @StateObject private var monitor = PortMonitor()
     @StateObject private var commandStore = CommandStore()
+    @StateObject private var runtime = CommandRuntime()
     @StateObject private var preferences = PortPreferences()
     @State private var selectedTab = 0
     @State private var editorPreset: CommandRule?
@@ -631,10 +666,9 @@ struct PortPilotView: View {
                             PortRow(
                                 port: port,
                                 rule: commandStore.rules.first(where: { $0.port == Optional(port.port) }),
-                                autoDiscovered: !configuredPorts.contains(port.port)
-                            ) { rule in
-                                launch(rule)
-                            } onEdit: {
+                                autoDiscovered: !configuredPorts.contains(port.port),
+                                isRunning: true
+                            ) {
                                 editorPreset = commandStore.rules.first(where: { $0.port == Optional(port.port) })
                                     ?? CommandRule(
                                         name: DevelopmentPortDetector.category(for: port) ?? "开发服务",
@@ -642,6 +676,12 @@ struct PortPilotView: View {
                                         command: "",
                                         workingDirectory: ""
                                     )
+                            } onToggle: {
+                                if let rule = commandStore.rules.first(where: { $0.port == Optional(port.port) }) {
+                                    stop(rule, detectedPort: port)
+                                } else {
+                                    pendingTermination = port
+                                }
                             } onTerminate: {
                                 pendingTermination = port
                             } onTogglePin: {
@@ -693,10 +733,18 @@ struct PortPilotView: View {
                 ScrollView {
                     LazyVStack(spacing: 8) {
                         ForEach(commandStore.rules) { rule in
-                            CommandRow(rule: rule, isRunning: rule.port.map { port in
-                                monitor.ports.contains(where: { $0.port == port })
-                            } ?? false) {
-                                launch(rule)
+                            let detectedPort = rule.port.flatMap { port in
+                                monitor.ports.first(where: { $0.port == port })
+                            }
+                            CommandRow(
+                                rule: rule,
+                                isRunning: runtime.isRunning(rule.id) || detectedPort != nil
+                            ) {
+                                if runtime.isRunning(rule.id) || detectedPort != nil {
+                                    stop(rule, detectedPort: detectedPort)
+                                } else {
+                                    launch(rule)
+                                }
                             } onDelete: {
                                 commandStore.remove(rule)
                             }
@@ -720,10 +768,19 @@ struct PortPilotView: View {
         }
 
         do {
-            try CommandLauncher.launch(rule)
+            try runtime.start(rule)
             if shouldAutoAssign {
                 watchForAutoAssignedPort(ruleID: rule.id, baselineKeys: baselineKeys)
             }
+        } catch {
+            launchError = error.localizedDescription
+        }
+    }
+
+    private func stop(_ rule: CommandRule, detectedPort: DetectedPort?) {
+        do {
+            try runtime.stop(rule, detectedPort: detectedPort)
+            monitor.refresh()
         } catch {
             launchError = error.localizedDescription
         }
@@ -772,8 +829,9 @@ struct PortRow: View {
     let port: DetectedPort
     let rule: CommandRule?
     let autoDiscovered: Bool
-    let onLaunch: (CommandRule) -> Void
+    let isRunning: Bool
     let onEdit: () -> Void
+    let onToggle: () -> Void
     let onTerminate: () -> Void
     let onTogglePin: () -> Void
     let isPinned: () -> Bool
@@ -813,22 +871,14 @@ struct PortRow: View {
             Spacer(minLength: 0)
 
             if let rule, !rule.command.isEmpty {
-                Button { onLaunch(rule) } label: {
-                    Image(systemName: "play.fill")
+                Button(action: onToggle) {
+                    Image(systemName: isRunning ? "pause.fill" : "play.fill")
                 }
                 .buttonStyle(.borderless)
-                .foregroundStyle(.green)
-                .help("启动端口")
-                .accessibilityLabel("启动端口")
+                .foregroundStyle(isRunning ? Color.secondary : Color.green)
+                .help(isRunning ? "暂停端口" : "启动端口")
+                .accessibilityLabel(isRunning ? "暂停端口" : "启动端口")
             }
-
-            Button(action: onTerminate) {
-                Image(systemName: "stop.fill")
-            }
-            .buttonStyle(.borderless)
-            .foregroundStyle(.red)
-            .help("终止占用此端口的进程")
-            .accessibilityLabel("终止端口")
 
             Button(action: onEdit) {
                 Image(systemName: rule == nil && autoDiscovered ? "pencil" : "ellipsis")
@@ -841,6 +891,9 @@ struct PortRow: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 7)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+        .contextMenu {
+            Button("终止占用此端口的进程", role: .destructive, action: onTerminate)
+        }
     }
 }
 
@@ -884,15 +937,16 @@ struct EmptyStateView: View {
 struct CommandRow: View {
     let rule: CommandRule
     let isRunning: Bool
-    let onLaunch: () -> Void
+    let onToggle: () -> Void
     let onDelete: () -> Void
 
     var body: some View {
+        let portLabel = rule.port.map { String($0) } ?? "自动"
         HStack(spacing: 8) {
             Image(systemName: isRunning ? "checkmark.circle.fill" : "terminal.fill")
                 .foregroundStyle(isRunning ? .green : .secondary)
                 .font(.caption)
-            Text(rule.name + ":" + (rule.port.map(String.init) ?? "自动"))
+            Text(verbatim: rule.name + ":" + portLabel)
                 .font(.caption.weight(.medium))
                 .lineLimit(1)
             Text(rule.command.isEmpty ? "仅监控" : rule.command)
@@ -903,19 +957,19 @@ struct CommandRow: View {
             if isRunning { Text("运行中").font(.caption2).foregroundStyle(.green) }
             Spacer()
             if !rule.command.isEmpty {
-                Button(action: onLaunch) {
-                    Image(systemName: "play.fill")
+                Button(action: onToggle) {
+                    Image(systemName: isRunning ? "pause.fill" : "play.fill")
                 }
                 .buttonStyle(.borderless)
-                .foregroundStyle(.green)
-                .help("启动端口")
-                .accessibilityLabel("启动端口")
+                .foregroundStyle(isRunning ? Color.secondary : Color.green)
+                .help(isRunning ? "暂停端口" : "启动端口")
+                .accessibilityLabel(isRunning ? "暂停端口" : "启动端口")
             }
-                Button(action: onDelete) {
-                    Image(systemName: "trash")
-                }
-                .buttonStyle(.borderless)
-                .foregroundStyle(.secondary)
+            Button(action: onDelete) {
+                Image(systemName: "trash")
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 7)
