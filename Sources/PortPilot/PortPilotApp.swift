@@ -870,14 +870,14 @@ struct PortRow: View {
 
             Spacer(minLength: 0)
 
-            if let rule, !rule.command.isEmpty {
+            if isRunning {
                 Button(action: onToggle) {
-                    Image(systemName: isRunning ? "pause.fill" : "play.fill")
+                    Image(systemName: "pause.fill")
                 }
                 .buttonStyle(.borderless)
-                .foregroundStyle(isRunning ? Color.secondary : Color.green)
-                .help(isRunning ? "暂停端口" : "启动端口")
-                .accessibilityLabel(isRunning ? "暂停端口" : "启动端口")
+                .foregroundStyle(Color.secondary)
+                .help("暂停端口")
+                .accessibilityLabel("暂停端口")
             }
 
             Button(action: onEdit) {
