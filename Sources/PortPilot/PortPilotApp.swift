@@ -108,13 +108,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let hostingView = NSHostingView(rootView: contentView)
         let visibleFrame = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let size = NSSize(width: 340, height: 390)
-        let origin = NSPoint(
-            x: visibleFrame.maxX - size.width - 18,
-            y: visibleFrame.maxY - size.height - 18
-        )
 
         let newWindow = NSWindow(
-            contentRect: NSRect(origin: origin, size: size),
+            contentRect: NSRect(origin: .zero, size: size),
             styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
             backing: .buffered,
             defer: false
@@ -129,6 +125,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         newWindow.isOpaque = false
         newWindow.backgroundColor = .clear
         newWindow.hasShadow = true
+        let frameSize = newWindow.frame.size
+        newWindow.setFrameOrigin(NSPoint(
+            x: visibleFrame.maxX - frameSize.width - 18,
+            y: visibleFrame.maxY - frameSize.height - 18
+        ))
         newWindow.contentView = hostingView
         newWindow.makeKeyAndOrderFront(nil)
         window = newWindow
@@ -257,6 +258,88 @@ final class WindowDragView: NSView {
     override func mouseUp(with event: NSEvent) {
         dragStartMouseLocation = nil
         dragStartWindowOrigin = nil
+    }
+}
+
+struct NativeWindowControls: NSViewRepresentable {
+    func makeNSView(context: Context) -> NativeWindowControlsView {
+        NativeWindowControlsView()
+    }
+
+    func updateNSView(_ nsView: NativeWindowControlsView, context: Context) {}
+}
+
+final class NativeWindowControlsView: NSView {
+    private let buttonTypes: [NSWindow.ButtonType] = [.closeButton, .miniaturizeButton, .zoomButton]
+    private var buttons: [NSButton] = []
+    private var windowObservers: [NSObjectProtocol] = []
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        removeWindowObservers()
+        if let window {
+            let notificationCenter = NotificationCenter.default
+            for name in [
+                NSWindow.didBecomeKeyNotification,
+                NSWindow.didResignKeyNotification,
+                NSWindow.didBecomeMainNotification,
+                NSWindow.didResignMainNotification
+            ] {
+                windowObservers.append(
+                    notificationCenter.addObserver(forName: name, object: window, queue: .main) { [weak self] _ in
+                        self?.keepButtonsVisible()
+                    }
+                )
+            }
+        }
+        attachNativeButtons()
+    }
+
+    deinit {
+        removeWindowObservers()
+    }
+
+    override func layout() {
+        super.layout()
+        let size = CGFloat(15)
+        let gap = CGFloat(8)
+        for (index, button) in buttons.enumerated() {
+            button.frame = NSRect(
+                x: CGFloat(index) * (size + gap),
+                y: (bounds.height - size) / 2,
+                width: size,
+                height: size
+            )
+        }
+    }
+
+    private func attachNativeButtons() {
+        guard let window else { return }
+        for buttonType in buttonTypes {
+            guard let button = window.standardWindowButton(buttonType), !buttons.contains(where: { $0 === button }) else {
+                continue
+            }
+            button.isHidden = false
+            button.alphaValue = 1
+            button.removeFromSuperview()
+            addSubview(button)
+            buttons.append(button)
+        }
+        keepButtonsVisible()
+        needsLayout = true
+    }
+
+    private func keepButtonsVisible() {
+        for button in buttons {
+            button.isHidden = false
+            button.alphaValue = 1
+        }
+    }
+
+    private func removeWindowObservers() {
+        let notificationCenter = NotificationCenter.default
+        windowObservers.forEach(notificationCenter.removeObserver)
+        windowObservers.removeAll()
     }
 }
 
@@ -428,6 +511,42 @@ enum DevelopmentPortDetector {
     }
 }
 
+enum PortHighlightColor: String, CaseIterable, Codable, Identifiable {
+    case automatic
+    case blue
+    case purple
+    case green
+    case orange
+    case red
+    case yellow
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .automatic: return "默认"
+        case .blue: return "蓝色"
+        case .purple: return "紫色"
+        case .green: return "绿色"
+        case .orange: return "橙色"
+        case .red: return "红色"
+        case .yellow: return "黄色"
+        }
+    }
+
+    var color: Color? {
+        switch self {
+        case .automatic: return nil
+        case .blue: return .blue
+        case .purple: return .purple
+        case .green: return .green
+        case .orange: return .orange
+        case .red: return .red
+        case .yellow: return .yellow
+        }
+    }
+}
+
 @MainActor
 final class CommandStore: ObservableObject {
     @Published var rules: [CommandRule] = [] {
@@ -468,13 +587,24 @@ final class CommandStore: ObservableObject {
 final class PortPreferences: ObservableObject {
     @Published private(set) var pinnedKeys: Set<String>
     @Published private(set) var orderKeys: [String]
+    @Published private(set) var hiddenKeys: Set<String>
+    @Published private(set) var highlightColors: [String: PortHighlightColor]
 
     private let pinnedStorageKey = "portpilot.pinned-port-keys"
     private let orderStorageKey = "portpilot.port-order-keys"
+    private let hiddenStorageKey = "portpilot.hidden-port-keys"
+    private let colorStorageKey = "portpilot.port-highlight-colors"
 
     init() {
         pinnedKeys = Set(UserDefaults.standard.stringArray(forKey: pinnedStorageKey) ?? [])
         orderKeys = UserDefaults.standard.stringArray(forKey: orderStorageKey) ?? []
+        hiddenKeys = Set(UserDefaults.standard.stringArray(forKey: hiddenStorageKey) ?? [])
+        let storedColors = UserDefaults.standard.dictionary(forKey: colorStorageKey) as? [String: String] ?? [:]
+        highlightColors = storedColors.reduce(into: [:]) { result, entry in
+            if let color = PortHighlightColor(rawValue: entry.value) {
+                result[entry.key] = color
+            }
+        }
     }
 
     static func key(for port: DetectedPort) -> String {
@@ -483,6 +613,34 @@ final class PortPreferences: ObservableObject {
 
     func isPinned(_ port: DetectedPort) -> Bool {
         pinnedKeys.contains(Self.key(for: port))
+    }
+
+    func isHidden(_ port: DetectedPort) -> Bool {
+        hiddenKeys.contains(Self.key(for: port))
+    }
+
+    func toggleHidden(_ port: DetectedPort) {
+        let key = Self.key(for: port)
+        if hiddenKeys.contains(key) {
+            hiddenKeys.remove(key)
+        } else {
+            hiddenKeys.insert(key)
+        }
+        save()
+    }
+
+    func highlightColor(for port: DetectedPort) -> PortHighlightColor {
+        highlightColors[Self.key(for: port)] ?? .automatic
+    }
+
+    func setHighlightColor(_ color: PortHighlightColor, for port: DetectedPort) {
+        let key = Self.key(for: port)
+        if color == .automatic {
+            highlightColors.removeValue(forKey: key)
+        } else {
+            highlightColors[key] = color
+        }
+        save()
     }
 
     func pinnedTransport(for port: Int) -> PortProtocol? {
@@ -534,6 +692,8 @@ final class PortPreferences: ObservableObject {
     private func save() {
         UserDefaults.standard.set(Array(pinnedKeys), forKey: pinnedStorageKey)
         UserDefaults.standard.set(orderKeys, forKey: orderStorageKey)
+        UserDefaults.standard.set(Array(hiddenKeys), forKey: hiddenStorageKey)
+        UserDefaults.standard.set(highlightColors.mapValues(\.rawValue), forKey: colorStorageKey)
     }
 }
 
@@ -633,6 +793,7 @@ final class CommandRuntime: ObservableObject {
     @Published private(set) var logs: [UUID: String] = [:]
     @Published var latestFailure: RuntimeFailure?
     private var processes: [UUID: Process] = [:]
+    private var inputHandles: [UUID: FileHandle] = [:]
     private var expectedStops: Set<UUID> = []
 
     func isRunning(_ ruleID: UUID) -> Bool {
@@ -642,6 +803,31 @@ final class CommandRuntime: ObservableObject {
     func log(for ruleID: UUID?) -> String {
         guard let ruleID else { return "" }
         return logs[ruleID] ?? ""
+    }
+
+    func canAcceptInput(for ruleID: UUID) -> Bool {
+        guard let process = processes[ruleID] else { return false }
+        return process.isRunning && inputHandles[ruleID] != nil
+    }
+
+    func sendInput(_ input: String, to ruleID: UUID) throws {
+        guard canAcceptInput(for: ruleID), let handle = inputHandles[ruleID] else {
+            throw NSError(
+                domain: "PortPilot",
+                code: 30,
+                userInfo: [NSLocalizedDescriptionKey: "该启动指令当前没有可用的输入通道"]
+            )
+        }
+        let line = input.hasSuffix("\n") ? input : input + "\n"
+        guard let data = line.data(using: .utf8) else {
+            throw NSError(
+                domain: "PortPilot",
+                code: 31,
+                userInfo: [NSLocalizedDescriptionKey: "无法编码输入指令"]
+            )
+        }
+        try handle.write(contentsOf: data)
+        appendLog("[输入] \(input)\n", ruleID: ruleID)
     }
 
     func start(_ rule: CommandRule) throws {
@@ -658,7 +844,8 @@ final class CommandRuntime: ObservableObject {
         let errorPipe = Pipe()
         process.executableURL = URL(fileURLWithPath: "/bin/zsh")
         process.arguments = ["-lc", command]
-        process.standardInput = FileHandle.nullDevice
+        let inputPipe = Pipe()
+        process.standardInput = inputPipe
         process.standardOutput = outputPipe
         process.standardError = errorPipe
         outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -681,7 +868,15 @@ final class CommandRuntime: ObservableObject {
                 self?.processDidExit(rule.id, name: rule.name, status: status)
             }
         }
-        try process.run()
+        inputHandles[rule.id] = inputPipe.fileHandleForWriting
+        do {
+            try process.run()
+        } catch {
+            closeInput(for: rule.id)
+            failedRuleIDs.insert(rule.id)
+            appendLog("\n[PortPilot] 启动失败：\(error.localizedDescription)\n", ruleID: rule.id)
+            throw error
+        }
         processes[rule.id] = process
         runningRuleIDs.insert(rule.id)
     }
@@ -703,6 +898,7 @@ final class CommandRuntime: ObservableObject {
         }
 
         if let process = processes.removeValue(forKey: rule.id) {
+            closeInput(for: rule.id)
             if process.isRunning { process.terminate() }
             runningRuleIDs.remove(rule.id)
             didStop = true
@@ -729,14 +925,20 @@ final class CommandRuntime: ObservableObject {
 
     private func processDidExit(_ ruleID: UUID, name: String, status: Int32) {
         processes.removeValue(forKey: ruleID)
+        closeInput(for: ruleID)
         runningRuleIDs.remove(ruleID)
         if expectedStops.remove(ruleID) != nil { return }
         guard status != 0 else { return }
 
         failedRuleIDs.insert(ruleID)
-        let message = "“\(name)”启动命令已退出，状态码：\(status)。点击端口行可查看运行日志。"
+        let message = "“\(name)”启动命令已退出，状态码：\(status)。点击启动指令或端口行可查看运行日志。"
         appendLog("\n[PortPilot] \(message)\n", ruleID: ruleID)
         latestFailure = RuntimeFailure(ruleID: ruleID, message: message)
+    }
+
+    private func closeInput(for ruleID: UUID) {
+        guard let handle = inputHandles.removeValue(forKey: ruleID) else { return }
+        try? handle.close()
     }
 
     private func shellQuote(_ value: String) -> String {
@@ -746,7 +948,7 @@ final class CommandRuntime: ObservableObject {
 
 struct PortLogTarget: Identifiable {
     let id: String
-    let port: DetectedPort
+    let port: DetectedPort?
     let rule: CommandRule?
 
     init(port: DetectedPort, rule: CommandRule?) {
@@ -755,20 +957,40 @@ struct PortLogTarget: Identifiable {
         let ruleKey = rule?.id.uuidString ?? "external"
         id = "\(port.id)-\(ruleKey)"
     }
+
+    init(rule: CommandRule, port: DetectedPort? = nil) {
+        self.port = port
+        self.rule = rule
+        let configuredPort = rule.port.map(String.init) ?? "auto"
+        let portKey = port?.id ?? "configured-\(configuredPort)"
+        id = "\(portKey)-\(rule.id.uuidString)"
+    }
 }
 
 struct RuntimeLogView: View {
     @ObservedObject var runtime: CommandRuntime
+    @ObservedObject var monitor: PortMonitor
     let target: PortLogTarget
-    @Environment(\.dismiss) private var dismiss
+    let isTransitioning: Bool
+    let onToggle: () -> Void
+    let onEdit: () -> Void
+    let onBack: () -> Void
+    @State private var input = ""
+    @State private var inputError: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("端口 \(target.port.port) 运行日志")
-                        .font(.headline)
-                    Text(target.rule?.name ?? "\(target.port.process) · PID \(target.port.pid)")
+                    Group {
+                        if let port = target.port {
+                            Text("端口 \(port.port) 运行日志")
+                        } else {
+                            Text("启动指令运行日志")
+                        }
+                    }
+                    .font(.headline)
+                    Text(target.rule?.name ?? target.port.map { "\($0.process) · PID \($0.pid)" } ?? "未知进程")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -778,14 +1000,39 @@ struct RuntimeLogView: View {
                         .font(.caption)
                         .foregroundStyle(.orange)
                 }
-                Button("关闭") { dismiss() }
+                Button("返回") { onBack() }
             }
 
             if let rule = target.rule {
-                Text(rule.command.isEmpty ? "仅监控端口" : rule.command)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                HStack(spacing: 8) {
+                    Button(action: onEdit) {
+                        HStack(spacing: 5) {
+                            Text(rule.command.isEmpty ? "仅监控端口" : rule.command)
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.secondary)
+                                .lineLimit(2)
+                                .truncationMode(.middle)
+                            Image(systemName: "pencil")
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("编辑启动指令")
+                    .accessibilityLabel("编辑启动指令 \(rule.name)")
+
+                    if !rule.command.isEmpty {
+                        Button(action: onToggle) {
+                            Label(isRunning ? "暂停" : "开始", systemImage: isRunning ? "pause.fill" : "play.fill")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(isTransitioning)
+                        .help(isRunning ? "暂停启动指令" : "开始启动指令")
+                    }
+                }
             }
 
             ScrollView {
@@ -796,9 +1043,73 @@ struct RuntimeLogView: View {
                     .padding(10)
             }
             .background(Color.black.opacity(0.18), in: RoundedRectangle(cornerRadius: 8))
+
+            inputBar
         }
-        .padding(16)
-        .frame(width: 520, height: 380)
+        .padding(.horizontal, 12)
+        .padding(.top, 8)
+        .padding(.bottom, 8)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var inputBar: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                TextField("输入指令并按回车", text: $input)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(!canEnterInput)
+                    .onSubmit(sendInput)
+                Button("发送", action: sendInput)
+                    .disabled(input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !canSendInput)
+            }
+            if let inputError {
+                Text(inputError)
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+            } else if target.rule == nil {
+                Text("外部进程不是由 PortPilot 启动，无法发送终端指令。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else if !canSendInput {
+                Text("请先点击“开始”；只有由 PortPilot 启动的命令可以接收输入。")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var currentPort: DetectedPort? {
+        guard let rule = target.rule, let configuredPort = rule.port else {
+            return target.port
+        }
+        return monitor.ports.first(where: { $0.port == configuredPort })
+    }
+
+    private var isRunning: Bool {
+        guard let rule = target.rule else { return currentPort != nil }
+        return runtime.isRunning(rule.id) || currentPort != nil
+    }
+
+    private var canEnterInput: Bool {
+        target.rule?.command.isEmpty == false
+    }
+
+    private var canSendInput: Bool {
+        guard let rule = target.rule else { return false }
+        return runtime.canAcceptInput(for: rule.id)
+    }
+
+    private func sendInput() {
+        guard let rule = target.rule else { return }
+        let trimmedInput = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedInput.isEmpty else { return }
+        do {
+            try runtime.sendInput(trimmedInput, to: rule.id)
+            input = ""
+            inputError = nil
+        } catch {
+            inputError = error.localizedDescription
+        }
     }
 
     private var logText: String {
@@ -821,6 +1132,7 @@ struct PortPilotView: View {
     @State private var activeAlert: PortPilotAlert?
     @State private var logTarget: PortLogTarget?
     @State private var draggedPortKey: String?
+    @State private var showingHiddenPorts = false
     @State private var transitioningPortKeys: Set<String> = []
     @State private var transitioningRuleIDs: Set<UUID> = []
 
@@ -828,22 +1140,47 @@ struct PortPilotView: View {
         VStack(spacing: 0) {
             WindowDragHandle()
                 .frame(maxWidth: .infinity)
-                .frame(height: 14)
+                .frame(height: 8)
                 .help("拖动窗口")
             header
-            Picker("", selection: $selectedTab) {
-                Text("监听端口").tag(0)
-                Text("启动指令").tag(1)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .padding(.horizontal, 16)
-            .padding(.bottom, 10)
-
-            if selectedTab == 0 {
-                portsView
+            if let preset = editorPreset {
+                CommandEditorView(initialRule: preset) { rule in
+                    commandStore.add(rule)
+                    editorPreset = nil
+                } onCancel: {
+                    editorPreset = nil
+                }
+            } else if let target = logTarget {
+                RuntimeLogView(
+                    runtime: runtime,
+                    monitor: monitor,
+                    target: target,
+                    isTransitioning: target.rule.map { transitioningRuleIDs.contains($0.id) } ?? false,
+                    onToggle: {
+                        toggleLogTarget(target)
+                    },
+                    onEdit: {
+                        editLogTarget(target)
+                    },
+                    onBack: {
+                        logTarget = nil
+                    }
+                )
             } else {
-                commandsView
+                Picker("", selection: $selectedTab) {
+                    Text("监听端口").tag(0)
+                    Text("启动指令").tag(1)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .padding(.horizontal, 16)
+                .padding(.bottom, 10)
+
+                if selectedTab == 0 {
+                    portsView
+                } else {
+                    commandsView
+                }
             }
 
             WindowDragHandle()
@@ -853,6 +1190,7 @@ struct PortPilotView: View {
         }
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
         .clipShape(RoundedRectangle(cornerRadius: 16))
+        .ignoresSafeArea()
         .onAppear {
             monitor.refresh()
         }
@@ -884,43 +1222,33 @@ struct PortPilotView: View {
                 )
             }
         }
-        .sheet(item: $editorPreset) { preset in
-            CommandEditorView(initialRule: preset) { rule in
-                commandStore.add(rule)
-                editorPreset = nil
-            } onCancel: {
-                editorPreset = nil
-            }
-        }
-        .sheet(item: $logTarget) { target in
-            RuntimeLogView(runtime: runtime, target: target)
-        }
     }
 
     private var header: some View {
-        HStack(alignment: .center) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text("PortPilot")
-                    .font(.title2.weight(.semibold))
-                Text("本机端口与开发服务")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        ZStack {
+            HStack(spacing: 8) {
+                NativeWindowControls()
+                    .frame(width: 68, height: 20)
+                WindowDragHandle()
+                    .frame(maxWidth: .infinity)
+                    .frame(height: 20)
+                    .help("拖动窗口")
+                Button {
+                    monitor.refresh()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .buttonStyle(.borderless)
+                .help("立即刷新")
             }
-            WindowDragHandle()
-                .frame(maxWidth: .infinity)
-                .frame(height: 34)
-                .help("拖动窗口")
-            Button {
-                monitor.refresh()
-            } label: {
-                Image(systemName: "arrow.clockwise")
-            }
-            .buttonStyle(.borderless)
-            .help("立即刷新")
+            Text("PortPilot")
+                .font(.title2.weight(.semibold))
+                .allowsHitTesting(false)
         }
+        .frame(height: 28)
         .padding(.horizontal, 16)
-        .padding(.top, 8)
-        .padding(.bottom, 12)
+        .padding(.top, 4)
+        .padding(.bottom, 6)
     }
 
     private var portsView: some View {
@@ -943,6 +1271,8 @@ struct PortPilotView: View {
             )
         }
         let orderedPorts = preferences.ordered(developmentPorts + pinnedStoppedPorts)
+        let visiblePorts = orderedPorts.filter { !preferences.isHidden($0) }
+        let hiddenPorts = orderedPorts.filter { preferences.isHidden($0) }
 
         return VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -971,58 +1301,37 @@ struct PortPilotView: View {
             } else {
                 ScrollView {
                     LazyVStack(spacing: 8) {
-                        ForEach(orderedPorts) { port in
-                            let detectedPort = monitor.ports.first(where: { $0.port == port.port })
-                            let rule = commandStore.rules.first(where: { $0.port == Optional(port.port) })
-                            PortRow(
-                                port: port,
-                                rule: rule,
-                                autoDiscovered: !configuredPorts.contains(port.port),
-                                isRunning: detectedPort != nil,
-                                hasError: rule.map { runtime.failedRuleIDs.contains($0.id) } ?? false,
-                                isTransitioning: transitioningPortKeys.contains(PortPreferences.key(for: port))
-                                    || rule.map { transitioningRuleIDs.contains($0.id) } == true
-                            ) {
-                                editorPreset = rule
-                                    ?? CommandRule(
-                                        name: DevelopmentPortDetector.category(for: port) ?? "开发服务",
-                                        port: port.port,
-                                        command: "",
-                                        workingDirectory: ""
-                                    )
-                            } onToggle: {
-                                guard !transitioningPortKeys.contains(PortPreferences.key(for: port)) else { return }
-                                if let rule {
-                                    if let detectedPort {
-                                        stop(rule, detectedPort: detectedPort)
-                                    } else {
-                                        launch(rule)
-                                    }
-                                } else {
-                                    activeAlert = .termination(port)
+                        ForEach(visiblePorts) { port in
+                            portRow(for: port)
+                        }
+
+                        if !hiddenPorts.isEmpty {
+                            Button {
+                                showingHiddenPorts.toggle()
+                            } label: {
+                                HStack(spacing: 6) {
+                                    Image(systemName: showingHiddenPorts ? "chevron.down" : "chevron.right")
+                                        .font(.caption2)
+                                    Text("隐藏端口（\(hiddenPorts.count)）")
+                                        .font(.caption.weight(.medium))
+                                    Spacer()
+                                    Text(showingHiddenPorts ? "收起" : "展开")
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
                                 }
-                            } onTerminate: {
-                                activeAlert = .termination(port)
-                            } onShowLog: {
-                                logTarget = PortLogTarget(port: port, rule: rule)
-                            } onTogglePin: {
-                                preferences.togglePin(port)
-                            } isPinned: {
-                                preferences.isPinned(port)
+                                .foregroundStyle(.secondary)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 5)
+                                .contentShape(Rectangle())
                             }
-                            .onDrag {
-                                let key = PortPreferences.key(for: port)
-                                draggedPortKey = key
-                                return NSItemProvider(object: key as NSString)
+                            .buttonStyle(.plain)
+                            .help(showingHiddenPorts ? "收起隐藏端口" : "展开隐藏端口")
+
+                            if showingHiddenPorts {
+                                ForEach(hiddenPorts) { port in
+                                    portRow(for: port)
+                                }
                             }
-                            .onDrop(
-                                of: [.text],
-                                delegate: PortDropDelegate(
-                                    targetKey: PortPreferences.key(for: port),
-                                    draggedKey: $draggedPortKey,
-                                    preferences: preferences
-                                )
-                            )
                         }
                     }
                     .padding(.horizontal, 12)
@@ -1030,6 +1339,67 @@ struct PortPilotView: View {
                 }
             }
         }
+    }
+
+    @ViewBuilder
+    private func portRow(for port: DetectedPort) -> some View {
+        let detectedPort = monitor.ports.first(where: { $0.port == port.port })
+        let rule = commandStore.rules.first(where: { $0.port == Optional(port.port) })
+        PortRow(
+            port: port,
+            rule: rule,
+            autoDiscovered: !configuredPorts.contains(port.port),
+            isRunning: detectedPort != nil,
+            hasError: rule.map { runtime.failedRuleIDs.contains($0.id) } ?? false,
+            isTransitioning: transitioningPortKeys.contains(PortPreferences.key(for: port))
+                || rule.map { transitioningRuleIDs.contains($0.id) } == true,
+            highlightColor: preferences.highlightColor(for: port),
+            isHidden: preferences.isHidden(port)
+        ) {
+            editorPreset = rule
+                ?? CommandRule(
+                    name: DevelopmentPortDetector.category(for: port) ?? "开发服务",
+                    port: port.port,
+                    command: "",
+                    workingDirectory: ""
+                )
+        } onToggle: {
+            guard !transitioningPortKeys.contains(PortPreferences.key(for: port)) else { return }
+            if let rule {
+                if let detectedPort {
+                    stop(rule, detectedPort: detectedPort)
+                } else {
+                    launch(rule)
+                }
+            } else {
+                activeAlert = .termination(port)
+            }
+        } onTerminate: {
+            activeAlert = .termination(port)
+        } onShowLog: {
+            logTarget = PortLogTarget(port: port, rule: rule)
+        } onTogglePin: {
+            preferences.togglePin(port)
+        } isPinned: {
+            preferences.isPinned(port)
+        } onSetColor: { color in
+            preferences.setHighlightColor(color, for: port)
+        } onToggleHidden: {
+            preferences.toggleHidden(port)
+        }
+        .onDrag {
+            let key = PortPreferences.key(for: port)
+            draggedPortKey = key
+            return NSItemProvider(object: key as NSString)
+        }
+        .onDrop(
+            of: [.text],
+            delegate: PortDropDelegate(
+                targetKey: PortPreferences.key(for: port),
+                draggedKey: $draggedPortKey,
+                preferences: preferences
+            )
+        )
     }
 
     private var commandsView: some View {
@@ -1072,6 +1442,10 @@ struct PortPilotView: View {
                                 } else {
                                     launch(rule)
                                 }
+                            } onEdit: {
+                                editorPreset = rule
+                            } onShowLog: {
+                                logTarget = PortLogTarget(rule: rule, port: detectedPort)
                             } onDelete: {
                                 commandStore.remove(rule)
                             }
@@ -1106,6 +1480,36 @@ struct PortPilotView: View {
             transitioningRuleIDs.remove(rule.id)
             showError(error.localizedDescription)
         }
+    }
+
+    private func toggleLogTarget(_ target: PortLogTarget) {
+        guard let rule = target.rule,
+              !rule.command.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              !transitioningRuleIDs.contains(rule.id)
+        else { return }
+
+        let detectedPort = currentDetectedPort(for: target)
+        if runtime.isRunning(rule.id) || detectedPort != nil {
+            stop(rule, detectedPort: detectedPort)
+        } else {
+            launch(rule)
+        }
+    }
+
+    private func editLogTarget(_ target: PortLogTarget) {
+        guard let rule = target.rule else { return }
+        logTarget = nil
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(150))
+            editorPreset = rule
+        }
+    }
+
+    private func currentDetectedPort(for target: PortLogTarget) -> DetectedPort? {
+        guard let rule = target.rule, let configuredPort = rule.port else {
+            return target.port
+        }
+        return monitor.ports.first(where: { $0.port == configuredPort })
     }
 
     private func stop(_ rule: CommandRule, detectedPort: DetectedPort?) {
@@ -1218,16 +1622,21 @@ struct PortRow: View {
     let isRunning: Bool
     let hasError: Bool
     let isTransitioning: Bool
+    let highlightColor: PortHighlightColor
+    let isHidden: Bool
     let onEdit: () -> Void
     let onToggle: () -> Void
     let onTerminate: () -> Void
     let onShowLog: () -> Void
     let onTogglePin: () -> Void
     let isPinned: () -> Bool
+    let onSetColor: (PortHighlightColor) -> Void
+    let onToggleHidden: () -> Void
 
     var body: some View {
         let processLabel = DevelopmentPortDetector.category(for: port) ?? port.process
         let pidLabel = port.pids.count > 1 ? "\(port.pid)+\(port.pids.count - 1)" : "\(port.pid)"
+        let displayName = rule?.name ?? DevelopmentPortDetector.category(for: port) ?? port.process
         HStack(spacing: 5) {
             Image(systemName: "line.3.horizontal")
                 .font(.caption2)
@@ -1250,8 +1659,9 @@ struct PortRow: View {
                         .font(.caption2.weight(.bold))
                         .foregroundStyle(port.transport == .tcp ? .blue : .orange)
 
-                    Text(rule?.name ?? DevelopmentPortDetector.category(for: port) ?? port.process)
+                    Text(displayName)
                         .font(.caption.weight(.medium))
+                        .foregroundStyle(highlightColor.color ?? .primary)
                         .lineLimit(1)
                         .truncationMode(.middle)
 
@@ -1294,17 +1704,48 @@ struct PortRow: View {
                 .accessibilityLabel(isRunning ? "暂停端口" : "启动端口")
             }
 
-            Button(action: onEdit) {
-                Image(systemName: rule == nil && autoDiscovered ? "pencil" : "ellipsis")
+            Menu {
+                Button("编辑", action: onEdit)
+                Menu("颜色") {
+                    ForEach(PortHighlightColor.allCases) { color in
+                        Button {
+                            onSetColor(color)
+                        } label: {
+                            if highlightColor == color {
+                                Label(color.label, systemImage: "checkmark")
+                            } else {
+                                Text(color.label)
+                            }
+                        }
+                    }
+                }
+                Divider()
+                if isHidden {
+                    Button("显示", action: onToggleHidden)
+                } else {
+                    Button("隐藏", role: .destructive, action: onToggleHidden)
+                }
+            } label: {
+                Image(systemName: "ellipsis")
             }
             .buttonStyle(.borderless)
+            .menuIndicator(.hidden)
             .foregroundStyle(.secondary)
-            .help(rule == nil && autoDiscovered ? "命名端口" : "编辑端口")
-            .accessibilityLabel(rule == nil && autoDiscovered ? "命名端口" : "编辑端口")
+            .help("更多")
+            .accessibilityLabel("更多")
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 7)
-        .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+        .background(
+            highlightColor.color?.opacity(0.18) ?? Color(nsColor: .controlBackgroundColor),
+            in: RoundedRectangle(cornerRadius: 10)
+        )
+        .overlay {
+            if let color = highlightColor.color {
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(color.opacity(0.6), lineWidth: 1)
+            }
+        }
         .contextMenu {
             if isRunning && !isTransitioning {
                 Button("终止占用此端口的进程", role: .destructive, action: onTerminate)
@@ -1356,30 +1797,41 @@ struct CommandRow: View {
     let hasError: Bool
     let isTransitioning: Bool
     let onToggle: () -> Void
+    let onEdit: () -> Void
+    let onShowLog: () -> Void
     let onDelete: () -> Void
 
     var body: some View {
         let portLabel = rule.port.map { String($0) } ?? "自动"
         HStack(spacing: 8) {
-            Image(systemName: isRunning ? "checkmark.circle.fill" : "terminal.fill")
-                .foregroundStyle(isRunning ? .green : .secondary)
-                .font(.caption)
-            Text(verbatim: rule.name + ":" + portLabel)
-                .font(.caption.weight(.medium))
-                .lineLimit(1)
-            Text(rule.command.isEmpty ? "仅监控" : rule.command)
-                .font(.caption.monospaced())
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-            if isRunning { Text("运行中").font(.caption2).foregroundStyle(.green) }
-            if hasError {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.caption2)
-                    .foregroundStyle(.orange)
-                    .help("启动命令报错")
+            Button(action: onShowLog) {
+                HStack(spacing: 8) {
+                    Image(systemName: isRunning ? "checkmark.circle.fill" : "terminal.fill")
+                        .foregroundStyle(isRunning ? .green : .secondary)
+                        .font(.caption)
+                    Text(verbatim: rule.name + ":" + portLabel)
+                        .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                    Text(rule.command.isEmpty ? "仅监控" : rule.command)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    if isRunning { Text("运行中").font(.caption2).foregroundStyle(.green) }
+                    if hasError {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.caption2)
+                            .foregroundStyle(.orange)
+                            .help("启动命令报错，点击查看日志")
+                    }
+                    Spacer(minLength: 0)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
             }
-            Spacer()
+            .buttonStyle(.plain)
+            .help("查看运行日志")
+            .accessibilityLabel("查看\(rule.name)运行日志")
             if isTransitioning {
                 ProgressView()
                     .controlSize(.small)
@@ -1396,11 +1848,18 @@ struct CommandRow: View {
                 .help(isRunning ? "暂停端口" : "启动端口")
                 .accessibilityLabel(isRunning ? "暂停端口" : "启动端口")
             }
-            Button(action: onDelete) {
-                Image(systemName: "trash")
+            Menu {
+                Button("编辑", action: onEdit)
+                Divider()
+                Button("删除", role: .destructive, action: onDelete)
+            } label: {
+                Image(systemName: "ellipsis")
             }
             .buttonStyle(.borderless)
+            .menuIndicator(.hidden)
             .foregroundStyle(.secondary)
+            .help("更多")
+            .accessibilityLabel("更多")
             .disabled(isTransitioning)
         }
         .padding(.horizontal, 8)
@@ -1429,7 +1888,7 @@ struct CommandEditorView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 10) {
             Text("添加/编辑端口")
                 .font(.title3.weight(.semibold))
             TextField("名称，例如：国内 Web", text: $name)
@@ -1438,7 +1897,7 @@ struct CommandEditorView: View {
             ZStack(alignment: .topLeading) {
                 TextEditor(text: $command)
                     .font(.system(.body, design: .monospaced))
-                    .frame(minHeight: 84, maxHeight: 132)
+                    .frame(minHeight: 70, maxHeight: 110)
                     .scrollContentBackground(.hidden)
                     .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 6))
                     .overlay {
@@ -1474,8 +1933,9 @@ struct CommandEditorView: View {
                 .disabled(!canSave)
             }
         }
-        .padding(22)
-        .frame(width: 360)
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
     }
 
     private var canSave: Bool {
