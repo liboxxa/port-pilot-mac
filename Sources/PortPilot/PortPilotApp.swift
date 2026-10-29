@@ -202,6 +202,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
+struct WindowDragHandle: NSViewRepresentable {
+    func makeNSView(context: Context) -> WindowDragView {
+        WindowDragView()
+    }
+
+    func updateNSView(_ nsView: WindowDragView, context: Context) {}
+}
+
+final class WindowDragView: NSView {
+    override func mouseDown(with event: NSEvent) {
+        guard let window else { return }
+        let wasMovableByWindowBackground = window.isMovableByWindowBackground
+        window.isMovableByWindowBackground = true
+        window.performDrag(with: event)
+        window.isMovableByWindowBackground = wasMovableByWindowBackground
+    }
+}
+
 enum PortProtocol: String, Codable, CaseIterable {
     case tcp = "TCP"
     case udp = "UDP"
@@ -768,6 +786,10 @@ struct PortPilotView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            WindowDragHandle()
+                .frame(maxWidth: .infinity)
+                .frame(height: 10)
+                .help("拖动窗口")
             header
             Picker("视图", selection: $selectedTab) {
                 Text("监听端口").tag(0)
@@ -782,6 +804,11 @@ struct PortPilotView: View {
             } else {
                 commandsView
             }
+
+            WindowDragHandle()
+                .frame(maxWidth: .infinity)
+                .frame(height: 6)
+                .help("拖动窗口")
         }
         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
         .clipShape(RoundedRectangle(cornerRadius: 16))
